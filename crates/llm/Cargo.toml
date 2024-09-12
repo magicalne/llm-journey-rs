@@ -1,0 +1,10 @@
+[package]
+name = "llm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+snafu = { workspace = true }
+
+gguf-rs = "0.1.3"
