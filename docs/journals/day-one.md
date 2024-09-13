@@ -62,8 +62,6 @@ Layer normalization and residual connections
 Understanding the transformer architecture is crucial for your project, as it will directly inform how you implement the inference engine in Rust. Pay special attention to the attention mechanism, as it's a key component you'll be implementing in the later stages of your project.
 Additional Resources:
 
-Rust Programming Language book (official documentation)
-While you have a background in Rust, it might be helpful to keep this as a reference, especially for the sections on performance and unsafe Rust, which might come in handy when optimizing your inference engine.
 Linear Algebra refresher
 A good understanding of linear algebra is crucial for implementing LLMs. Khan Academy or MIT OpenCourseWare have excellent resources if you need to brush up on concepts like matrix multiplication, vector spaces, and eigenvalues/eigenvectors.
 "Mathematics for Machine Learning" by Marc Peter Deisenroth, A. Aldo Faisal, and Cheng Soon Ong

@@ -1,5 +1,5 @@
 ---
-title: "Day One"
+title: "Day Two"
 date: 2024-09-12
 ---
 
@@ -380,8 +380,6 @@ Let's walk through a simple example with the text "hello."
 Both tokenizers and BBPE are essential tools in the NLP toolkit, enabling models to process and understand text data effectively.
 
 ## Embeddings in LLMs
-
-Certainly! **Embeddings** are a fundamental concept in large language models (LLMs) like GPT (Generative Pre-trained Transformer). They play a crucial role in converting raw text data into a format that can be processed by neural networks. Let's delve into what embeddings are, how they work, and their significance in LLMs.
 
 ### What Are Embeddings?
 
