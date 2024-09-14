@@ -48,3 +48,4 @@ Turns out Layer normalization is alternative of batch normalization.
 > on, all the hidden units in a layer share the same normalization terms µ and σ, but different training cases have different normalization terms.
 
 And what is batch normalization doesn't matter now.
+

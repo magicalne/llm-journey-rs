@@ -27,7 +27,7 @@ pub struct ModelConfig {
     pub initializer_range: f32,
     pub intermediate_size: i32,
     pub kv_lora_rank: i32,
-    pub max_position_embeddings: i32,
+    pub max_position_embeddings: usize,
     pub model_type: String,
     pub moe_intermediate_size: i32,
     pub moe_layer_freq: i32,
@@ -35,15 +35,15 @@ pub struct ModelConfig {
     pub n_routed_experts: i32,
     pub n_shared_experts: i32,
     pub norm_topk_prob: bool,
-    pub num_attention_heads: i32,
+    pub num_attention_heads: usize,
     pub num_experts_per_tok: i32,
-    pub num_hidden_layers: i32,
-    pub num_key_value_heads: i32,
+    pub num_hidden_layers: usize,
+    pub num_key_value_heads: usize,
     pub pretraining_tp: i32,
     pub q_lora_rank: Option<i32>,
     pub qk_nope_head_dim: i32,
     pub qk_rope_head_dim: i32,
-    pub rms_norm_eps: f32,
+    pub rms_norm_eps: f64,
     pub rope_scaling: RopeScaling,
     pub rope_theta: i32,
     pub routed_scaling_factor: f32,
@@ -57,6 +57,7 @@ pub struct ModelConfig {
     pub use_cache: bool,
     pub v_head_dim: i32,
     pub vocab_size: i32,
+    pub use_flash_attn: bool,
 }
 
 impl ModelConfig {
@@ -113,6 +114,7 @@ impl ModelConfig {
             use_cache: true,
             v_head_dim: 128,
             vocab_size: 102400,
+            use_flash_attn: true,
         }
     }
 }
