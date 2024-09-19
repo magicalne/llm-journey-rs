@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::{ops::Mul, sync::Arc};
 
 use crate::deepseek2::config::ModelConfig;
 use anyhow::{anyhow, Result};
 use candle_core::{self, quantized::gguf_file, DType, Device, Module, Tensor, D};
-use candle_nn::{Embedding, LayerNorm};
+use candle_nn::{rotary_emb, Activation, Embedding, LayerNorm};
 use candle_transformers::{
     models::quantized_llama,
     quantized_nn::{linear_no_bias, Linear, RmsNorm},
@@ -12,62 +12,82 @@ use candle_transformers::{
 };
 
 #[derive(Debug, Clone)]
-struct BlockSparseTop2MLP {
-    w1: Linear,
-    w2: Linear,
-    w3: Linear,
+struct DeepSeekV2MLP {
+    config: ModelConfig,
+    hidden_size: usize,
+    intermediate_size: usize,
+    gate_proj: Linear,
+    down_proj: Linear,
+    up_proj: Linear,
     act_fn: Activation,
 }
 
-impl BlockSparseTop2MLP {
-    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let hidden_sz = cfg.hidden_size;
-        let intermediate_sz = cfg.intermediate_size;
-        let w1 = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("w1"))?;
-        let w2 = linear_no_bias(intermediate_sz, hidden_sz, vb.pp("w2"))?;
-        let w3 = linear_no_bias(hidden_sz, intermediate_sz, vb.pp("w3"))?;
+impl DeepSeekV2MLP {
+    fn new(cfg: &ModelConfig, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
+        let hidden_size = cfg.hidden_size;
+        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
+        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
+        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
         Ok(Self {
-            w1,
-            w2,
-            w3,
+            config: cfg.clone(),
             act_fn: cfg.hidden_act,
+            hidden_size,
+            intermediate_size,
+            gate_proj,
+            down_proj,
+            up_proj,
         })
     }
 }
 
-impl Module for BlockSparseTop2MLP {
+impl Module for DeepSeekV2MLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = xs.apply(&self.w1)?.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.w3)?;
-        (lhs * rhs)?.apply(&self.w2)
+        //gate_up, _ = self.gate_up_proj(x)
+        //x = self.act_fn(gate_up)
+        //x, _ = self.down_proj(x)
+
+        xs.apply(&self.gate_proj)?
+            .apply(&self.down_proj)
+            .mul(xs.apply(&self.up_proj)?)
     }
 }
 
 #[derive(Debug, Clone)]
-struct SparseMoeBlock {
+struct DeepseekV2Moe {
+    config: ModelConfig,
+    num_experts_per_tok: usize,
     gate: Linear,
-    experts: Vec<BlockSparseTop2MLP>,
+    experts: Vec<DeepSeekV2MLP>,
+    shared_experts: DeepSeekV2MLP,
     num_experts_per_tok: usize,
 }
 
-impl SparseMoeBlock {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let gate = linear_no_bias(cfg.hidden_size, cfg.num_local_experts, vb.pp("gate"))?;
-        let mut experts = Vec::with_capacity(cfg.num_local_experts);
+impl DeepseekV2Moe {
+    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        let ep_size = 1;
+        let expert_per_rank = cfg.n_routed_experts;
+        let ep_rank = 0;
+        let gate = linear_no_bias(cfg.hidden_size, cfg.n_routed_experts, vb.pp("gate"))?;
+        let mut experts = Vec::with_capacity(cfg.n_routed_experts);
         let vb = vb.pp("experts");
-        for idx in 0..cfg.num_local_experts {
-            let expert = BlockSparseTop2MLP::new(cfg, vb.pp(idx))?;
+        for idx in 0..cfg.n_routed_experts {
+            let expert = DeepSeekV2MLP::new(cfg, cfg.moe_intermediate_size, vb.pp(idx))?;
             experts.push(expert)
         }
-        Ok(SparseMoeBlock {
+        let vb = vb.pp("shared_experts");
+        let intermediate_size = cfg.moe_intermediate_size * cfg.n_shared_experts;
+        let shared_experts = DeepSeekV2MLP::new(cfg, intermediate_size, vb);
+        Ok(DeepseekV2Moe {
+            config: cfg.clone(),
+            num_experts_per_tok: cfg.num_experts_per_tok,
             gate,
             experts,
-            num_experts_per_tok: cfg.num_experts_per_tok,
+            shared_experts,
         })
     }
 }
 
-impl Module for SparseMoeBlock {
+impl Module for DeepseekV2Moe {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let xs = xs.reshape(((), hidden_dim))?;
@@ -143,7 +163,7 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let hidden_sz = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
@@ -242,17 +262,17 @@ fn flash_attn(
     candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
 }
 #[derive(Debug, Clone)]
-struct DecoderLayer {
-    self_attn: Attention,
-    block_sparse_moe: SparseMoeBlock,
+struct DeepseekV2DecoderLayer {
+    hidden_size: usize,
+    self_attn: Attention, // TODO
+    mlp: dyn Module,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
 
-impl DecoderLayer {
-    fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"))?;
-        let block_sparse_moe = SparseMoeBlock::new(cfg, vb.pp("block_sparse_moe"))?;
+impl DeepseekV2DecoderLayer {
+    fn new(cfg: &Config, layer_id: usize, vb: VarBuilder) -> Result<Self> {
+        let self_attn = Attention::new(cfg, vb.pp("self_attn"))?;
         let input_layernorm =
             RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = RmsNorm::new(
@@ -260,9 +280,20 @@ impl DecoderLayer {
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
+
+        let mlp_vb = vb.pp("mlp");
+        let mlp = if cfg.n_routed_experts > 0
+            && layer_id > cfg.first_k_dense_replace
+            && layer_id % cfg.moe_layer_freq == 0
+        {
+            DeepseekV2Moe::new(cfg, vb)
+        } else {
+            DeepSeekV2MLP::new(cfg, cfg.intermediate_size, vb)
+        };
         Ok(Self {
+            hidden_size: cfg.hidden_size,
             self_attn,
-            block_sparse_moe,
+            mlp,
             input_layernorm,
             post_attention_layernorm,
         })
@@ -279,9 +310,7 @@ impl DecoderLayer {
         let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let xs = xs
-            .apply(&self.post_attention_layernorm)?
-            .apply(&self.block_sparse_moe)?;
+        let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
         residual + xs
     }
 }
@@ -289,12 +318,7 @@ impl DecoderLayer {
 pub struct Model {
     token_embeddings: Embedding,
     norm: RmsNorm,
-}
-
-struct TransformerLayer {
-    attention: MultiHeadAttention,
-    ln_1: LayerNorm,
-    ln_2: LayerNorm,
+    layers: Vec<DeepseekV2DecoderLayer>,
 }
 
 struct MultiHeadAttention {
@@ -307,9 +331,19 @@ impl Model {
         let weights = weights.dequantize(device)?;
         let token_embeddings = Embedding::new(weights, config.hidden_size);
         let norm = RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
+        //
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        let vb_l = vb.pp("layers");
+        for layer_idx in 0..config.num_hidden_layers {
+            let layer = DeepseekV2DecoderLayer::new(cfg, layer_idx, vb_l.pp(layer_idx))?;
+            layers.push(layer)
+        }
+        //
+
         Ok(Self {
             token_embeddings,
             norm,
+            layers,
         })
     }
 }

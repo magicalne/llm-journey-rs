@@ -29,11 +29,11 @@ pub struct ModelConfig {
     pub kv_lora_rank: i32,
     pub max_position_embeddings: usize,
     pub model_type: String,
-    pub moe_intermediate_size: i32,
+    pub moe_intermediate_size: usize,
     pub moe_layer_freq: i32,
     pub n_group: i32,
     pub n_routed_experts: i32,
-    pub n_shared_experts: i32,
+    pub n_shared_experts: usize,
     pub norm_topk_prob: bool,
     pub num_attention_heads: usize,
     pub num_experts_per_tok: i32,
@@ -58,6 +58,9 @@ pub struct ModelConfig {
     pub v_head_dim: i32,
     pub vocab_size: i32,
     pub use_flash_attn: bool,
+
+    // training configs
+    pub ep_size: Option<usize>,
 }
 
 impl ModelConfig {
@@ -115,6 +118,7 @@ impl ModelConfig {
             v_head_dim: 128,
             vocab_size: 102400,
             use_flash_attn: true,
+            ep_size: None,
         }
     }
 }
