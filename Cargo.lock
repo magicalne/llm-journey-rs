@@ -138,6 +138,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen_cuda"
+version = "0.1.6"
+source = "git+https://github.com/guoqingbao/bindgen_cuda.git#fb7ed75f3901b146aa1ba460baaeed5b494f2e0d"
+dependencies = [
+ "glob",
+ "num_cpus",
+ "rayon",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -192,9 +202,8 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "candle-core"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5b18de020c2729dbf7ac390325312644808b6ba9b7962f1f724e9185b1d53c7"
+version = "0.6.1"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8a99f7c#8a99f7cf31a1d8f175281492eaa7026730067d08"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -215,30 +224,27 @@ dependencies = [
 
 [[package]]
 name = "candle-flash-attn"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0849ff57cb043c3e03bb4415435a1d229b02f50bf2740d21ca1aa493064d025b"
+version = "0.6.1"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8a99f7c#8a99f7cf31a1d8f175281492eaa7026730067d08"
 dependencies = [
  "anyhow",
- "bindgen_cuda",
+ "bindgen_cuda 0.1.5",
  "candle-core",
  "half",
 ]
 
 [[package]]
 name = "candle-kernels"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bc0a71be8b2f0950b63fd602a5e10a74a4f94a5fd63059ae455e96163389488"
+version = "0.6.1"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8a99f7c#8a99f7cf31a1d8f175281492eaa7026730067d08"
 dependencies = [
- "bindgen_cuda",
+ "bindgen_cuda 0.1.5",
 ]
 
 [[package]]
 name = "candle-nn"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b006b30f66a0d94fc9cef0ac4de6ce510565f35ae2c6c35ce5d4aacfb0fc8eeb"
+version = "0.6.1"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8a99f7c#8a99f7cf31a1d8f175281492eaa7026730067d08"
 dependencies = [
  "candle-core",
  "half",
@@ -251,9 +257,8 @@ dependencies = [
 
 [[package]]
 name = "candle-transformers"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f0d4eb6a0d9279d5829b06b2bf3caa117904eefd6dcf879d16e687c4a84034c"
+version = "0.6.1"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8a99f7c#8a99f7cf31a1d8f175281492eaa7026730067d08"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -444,9 +449,9 @@ checksum = "7a81dae078cea95a014a339291cec439d2f232ebe854a9d672b796c6afafa9b7"
 
 [[package]]
 name = "cudarc"
-version = "0.11.9"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a5bd4d1eee570c3b2ac64ed114125517dd1e541d88dd28fc259f1de4dba8d60"
+checksum = "38cd60a9a42ec83a2ed7effb0b1f073270264ea99da7acfc44f7e8d74dee0384"
 dependencies = [
  "half",
  "libloading",
@@ -1019,6 +1024,7 @@ name = "llm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bindgen_cuda 0.1.6",
  "candle-core",
  "candle-flash-attn",
  "candle-nn",

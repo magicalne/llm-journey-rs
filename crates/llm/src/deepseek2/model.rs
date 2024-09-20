@@ -1,4 +1,4 @@
-use std::{ops::Mul, sync::Arc};
+use std::{any::Any, ops::Mul, sync::Arc};
 
 use crate::deepseek2::config::ModelConfig;
 use anyhow::{anyhow, Result};
@@ -10,6 +10,8 @@ use candle_transformers::{
     quantized_var_builder::VarBuilder,
     utils::repeat_kv,
 };
+
+use super::rotary_embedding::DeepseekScalingRotaryEmbedding;
 
 #[derive(Debug, Clone)]
 struct DeepSeekV2MLP {
@@ -147,45 +149,107 @@ impl Module for DeepseekV2Moe {
 }
 
 #[derive(Debug, Clone)]
+enum AttentionType {
+    Normal {
+        q_a_norm: RmsNorm,
+        q_a_proj: Linear,
+        q_b_proj: Linear,
+    },
+    Lite {
+        q_proj: Linear,
+    },
+}
+
+impl AttentionType {
+    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        let qk_head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+        Ok(match cfg.q_lora_rank {
+            Some(q_lora_rank) => {
+                let q_a_norm = RmsNorm::new(q_lora_rank, cfg.rms_norm_eps, vb.pp("q_a_layernorm"))?;
+                let q_a_proj = linear_no_bias(cfg.hidden_size, q_lora_rank, vb.pp("q_a_proj"))?;
+
+                let q_b_proj = linear_no_bias(
+                    q_lora_rank,
+                    cfg.num_attention_heads * qk_head_dim,
+                    vb.pp("q_a_proj"),
+                )?;
+                Self::Normal {
+                    q_a_norm,
+                    q_a_proj,
+                    q_b_proj,
+                }
+            }
+            None => {
+                let q_proj = linear_no_bias(
+                    cfg.hidden_size,
+                    cfg.num_attention_heads * qk_head_dim,
+                    vb.pp("q_proj"),
+                )?;
+                Self::Lite { q_proj }
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    layer_id: usize,
+    q_type: AttentionType,
+    kv_a_proj_with_mqa: Linear,
+    kv_a_layernorm: RmsNorm,
+    kv_b_proj: Linear,
     o_proj: Linear,
-    num_heads: usize,
-    num_kv_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-    hidden_size: usize,
-    rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: Option<(Tensor, Tensor)>,
-    use_flash_attn: bool,
+    rotary_emb: DeepseekScalingRotaryEmbedding,
 }
 
 impl Attention {
-    fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let hidden_sz = cfg.hidden_size;
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let num_kv_groups = num_heads / num_kv_heads;
-        let head_dim = hidden_sz / num_heads;
-        let q_proj = linear_no_bias(hidden_sz, num_heads * head_dim, vb.pp("q_proj"))?;
-        let k_proj = linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("k_proj"))?;
-        let v_proj = linear_no_bias(hidden_sz, num_kv_heads * head_dim, vb.pp("v_proj"))?;
-        let o_proj = linear_no_bias(num_heads * head_dim, hidden_sz, vb.pp("o_proj"))?;
+    fn new(
+        cfg: &ModelConfig,
+        layer_id: usize,
+        vb: VarBuilder,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let q_type = AttentionType::new(cfg, vb.clone())?;
+        let kv_a_proj_with_mqa = linear_no_bias(
+            cfg.hidden_size,
+            cfg.kv_lora_rank + cfg.qk_rope_head_dim,
+            vb.pp("kv_a_proj_with_mqa"),
+        )?;
+        let kv_a_layernorm =
+            RmsNorm::new(cfg.kv_lora_rank, cfg.rms_norm_eps, vb.pp("kv_a_layernorm"))?;
+        let out_dim = cfg.num_attention_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim);
+        let kv_b_proj = linear_no_bias(cfg.kv_lora_rank, out_dim, vb)?;
+        let o_proj = linear_no_bias(
+            cfg.num_attention_heads * cfg.v_head_dim,
+            cfg.hidden_size,
+            vb.pp("o_proj"),
+        )?;
+        let rope_scaling = cfg.rope_scaling;
+        let rotary_emb = DeepseekScalingRotaryEmbedding::new(
+            cfg.qk_rope_head_dim,
+            cfg.qk_rope_head_dim,
+            cfg.max_position_embeddings,
+            cfg.rope_theta,
+            false,
+            rope_scaling.factor,
+            dtype,
+            1.,
+            1.,
+            rope_scaling.beta_fast,
+            rope_scaling.beta_slow,
+            1.,
+            0.,
+            device,
+        )?;
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            layer_id,
+            q_type,
+            kv_a_proj_with_mqa,
+            kv_a_layernorm,
+            kv_b_proj,
             o_proj,
-            num_heads,
-            num_kv_heads,
-            num_kv_groups,
-            head_dim,
-            hidden_size: hidden_sz,
             rotary_emb,
-            kv_cache: None,
-            use_flash_attn: cfg.use_flash_attn,
         })
     }
 
@@ -271,8 +335,14 @@ struct DeepseekV2DecoderLayer {
 }
 
 impl DeepseekV2DecoderLayer {
-    fn new(cfg: &Config, layer_id: usize, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Attention::new(cfg, vb.pp("self_attn"))?;
+    fn new(
+        cfg: &Config,
+        layer_id: usize,
+        vb: VarBuilder,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let self_attn = Attention::new(cfg, layer_id, vb.pp("self_attn"), device, dtype)?;
         let input_layernorm =
             RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let post_attention_layernorm = RmsNorm::new(
@@ -321,21 +391,23 @@ pub struct Model {
     layers: Vec<DeepseekV2DecoderLayer>,
 }
 
-struct MultiHeadAttention {
-    // Implement multi-head attention structure
-}
-
 impl Model {
     pub fn from_gguf(config: &ModelConfig, device: &Device, vb: VarBuilder) -> Result<Self> {
         let weights = vb.get_no_shape("token_embd.weight")?;
+        let dtype = weights.dtype();
         let weights = weights.dequantize(device)?;
         let token_embeddings = Embedding::new(weights, config.hidden_size);
         let norm = RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
-        //
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let vb_l = vb.pp("layers");
         for layer_idx in 0..config.num_hidden_layers {
-            let layer = DeepseekV2DecoderLayer::new(cfg, layer_idx, vb_l.pp(layer_idx))?;
+            let layer = DeepseekV2DecoderLayer::new(
+                cfg,
+                layer_idx,
+                vb_l.pp(layer_idx),
+                device,
+                dtype.into(),
+            )?;
             layers.push(layer)
         }
         //
@@ -377,48 +449,6 @@ impl Module for T5LayerNorm {
         let xs = xs.to_dtype(dtype)?;
         let xs = xs.broadcast_mul(&self.weight)?;
         Ok(xs)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct RotaryEmbedding {
-    sin: Tensor,
-    cos: Tensor,
-}
-
-impl RotaryEmbedding {
-    fn new(cfg: &ModelConfig, dev: &Device) -> candle_core::Result<Self> {
-        let dim = cfg.qk_rope_head_dim;
-        let rope_theta = cfg.rope_theta as f32; // base
-        let max_seq_len = cfg.max_position_embeddings;
-        let inv_freq: Vec<_> = (0..dim)
-            .step_by(2)
-            .map(|i| 1f32 / rope_theta.powf(i as f32 / dim as f32))
-            .collect();
-        let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
-        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(DType::F32)?
-            .reshape((max_seq_len, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
-        Ok(Self {
-            sin: freqs.sin()?,
-            cos: freqs.cos()?,
-        })
-    }
-
-    fn apply_rotary_emb_qkv(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        seqlen_offset: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        let cos = self.cos.narrow(0, seqlen_offset, seq_len)?;
-        let sin = self.sin.narrow(0, seqlen_offset, seq_len)?;
-        let q_embed = candle_nn::rotary_emb::rope(q, &cos, &sin)?;
-        let k_embed = candle_nn::rotary_emb::rope(k, &cos, &sin)?;
-        Ok((q_embed, k_embed))
     }
 }
 
