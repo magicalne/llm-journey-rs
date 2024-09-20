@@ -1,281 +1,236 @@
-use anyhow::Result;
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor, D};
 
-#[derive(Debug, Clone)]
-pub struct DeepseekScalingRotaryEmbedding {
-    head_size: usize,
-    rotary_dim: usize,
-    max_position_embeddings: usize,
-    base: f64,
-    is_neox_style: bool,
-    scaling_factor: f64,
-    extrapolation_factor: f64,
-    attn_factor: f64,
-    beta_fast: usize,
-    beta_slow: usize,
-    mscale: f64,
-    mscale_all_dim: f64,
-    cos_sin_cache: Tensor,
-}
-
-impl DeepseekScalingRotaryEmbedding {
-    pub fn new(
-        head_size: usize,
-        rotary_dim: usize,
-        max_position_embeddings: usize,
-        base: f64,
-        is_neox_style: bool,
-        scaling_factor: f64,
-        dtype: DType,
-        extrapolation_factor: f64,
-        attn_factor: f64,
-        beta_fast: usize,
-        beta_slow: usize,
-        mscale: f64,
-        mscale_all_dim: f64,
-        device: &Device,
-    ) -> Result<Self> {
-        let mscale = yarn_get_mscale(scaling_factor, mscale)
-            / yarn_get_mscale(scaling_factor, mscale_all_dim)
-            * attn_factor;
-        let cos_sin_cache = Self::compute_cos_sin_cache(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            scaling_factor,
-            extrapolation_factor,
-            attn_factor,
-            beta_fast,
-            beta_slow,
-            mscale,
-            dtype,
-            device,
-        )?;
-
-        Ok(Self {
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            scaling_factor,
-            extrapolation_factor,
-            attn_factor,
-            beta_fast,
-            beta_slow,
-            mscale,
-            mscale_all_dim,
-            cos_sin_cache,
-        })
-    }
-
-    fn compute_cos_sin_cache(
-        head_size: usize,
-        rotary_dim: usize,
-        max_position_embeddings: usize,
-        base: f64,
-        is_neox_style: bool,
-        scaling_factor: f64,
-        extrapolation_factor: f64,
-        attn_factor: f64,
-        beta_fast: usize,
-        beta_slow: usize,
-        mscale: f64,
-        dtype: DType,
-        device: &Device,
-    ) -> Result<Tensor> {
-        let inv_freq = Self::compute_inv_freq(
-            base,
-            rotary_dim,
-            scaling_factor,
-            extrapolation_factor,
-            attn_factor,
-            beta_fast,
-            beta_slow,
-            max_position_embeddings,
-            dtype,
-        )?;
-        let t = Tensor::arange(
-            0,
-            max_position_embeddings as u32 * scaling_factor as u32,
-            device,
-        )?
-        .to_dtype(dtype)?;
-        let freqs = t.matmul(&inv_freq)?;
-        let cos = (freqs.cos()? * mscale)?;
-        let sin = (freqs.sin()? * mscale)?;
-        Ok(Tensor::cat(&[&cos, &sin], D::Minus1)?)
-    }
-
-    fn compute_inv_freq(
-        base: f64,
-        rotary_dim: usize,
-        scaling_factor: f64,
-        extrapolation_factor: f64,
-        attn_factor: f64,
-        beta_fast: usize,
-        beta_slow: usize,
-        max_position_embeddings: usize,
-        dtype: DType,
-    ) -> Result<Tensor> {
-        let pos_freqs = Tensor::from_slice(
-            &(0..rotary_dim)
-                .step_by(2)
-                .map(|i| base.powf(i as f64 / rotary_dim as f64))
-                .collect::<Vec<f64>>(),
-            (rotary_dim / 2,),
-            &Device::Cpu,
-        )?;
-        let inv_freq_extrapolation =
-            (Tensor::ones((rotary_dim / 2,), dtype, &Device::Cpu)? / &pos_freqs)?;
-        let inv_freq_interpolation = (Tensor::ones((rotary_dim / 2,), dtype, &Device::Cpu)?
-            / (&pos_freqs * scaling_factor))?;
-
-        let (low, high) = yarn_find_correction_range(
-            beta_fast,
-            beta_slow,
-            rotary_dim,
-            base,
-            max_position_embeddings,
-        );
-        let inv_freq_mask = (1 - yarn_linear_ramp_mask(low, high, rotary_dim / 2, dtype)?)?;
-        let inv_freq = (inv_freq_interpolation * (1.0 - &inv_freq_mask)
-            + inv_freq_extrapolation * &inv_freq_mask)?;
-        Ok(inv_freq)
-    }
-
-    pub fn forward(
-        &self,
-        positions: &Tensor,
-        query: &Tensor,
-        key: &Tensor,
-        offsets: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor), candle::Error> {
-        let query_rot = query.narrow(-1, 0, self.rotary_dim)?;
-        let key_rot = key.narrow(-1, 0, self.rotary_dim)?;
-        let query_pass = if self.rotary_dim < self.head_size {
-            Some(query.narrow(-1, self.rotary_dim, self.head_size - self.rotary_dim)?)
-        } else {
-            None
-        };
-        let key_pass = if self.rotary_dim < self.head_size {
-            Some(key.narrow(-1, self.rotary_dim, self.head_size - self.rotary_dim)?)
-        } else {
-            None
-        };
-
-        let cos_sin = if let Some(offsets) = offsets {
-            self.cos_sin_cache
-                .narrow(0, positions + offsets, positions.shape()[0])?
-        } else {
-            self.cos_sin_cache
-                .narrow(0, positions, positions.shape()[0])?
-        };
-        let (cos, sin) = cos_sin.chunk(2, -1)?;
-
-        let rotate_fn = if self.is_neox_style {
-            rotate_neox
-        } else {
-            rotate_gptj
-        };
-        let query_rot = query_rot * &cos + rotate_fn(&query_rot) * &sin;
-        let key_rot = key_rot * &cos + rotate_fn(&key_rot) * &sin;
-
-        let query = if let Some(query_pass) = query_pass {
-            Tensor::cat(&[&query_rot, &query_pass], -1)?
-        } else {
-            query_rot
-        };
-        let key = if let Some(key_pass) = key_pass {
-            Tensor::cat(&[&key_rot, &key_pass], -1)?
-        } else {
-            key_rot
-        };
-
-        Ok((query, key))
-    }
-}
-
-fn yarn_get_mscale(scale: f64, mscale: f64) -> f64 {
-    if scale <= 1.0 {
-        1.0
-    } else {
-        0.1 * mscale * scale.ln() + 1.0
-    }
-}
-
-fn yarn_find_correction_dim(
-    num_rotations: usize,
+fn find_correction_dim(
+    num_rotations: f64,
     dim: usize,
     base: f64,
     max_position_embeddings: usize,
 ) -> f64 {
-    (dim * (max_position_embeddings as f64 / (num_rotations as f64 * 2.0 * std::f64::consts::PI))
-        .ln())
+    (dim as f64
+        * (max_position_embeddings as f64 / (num_rotations * 2.0 * std::f64::consts::PI)).ln())
         / (2.0 * base.ln())
 }
 
-fn yarn_find_correction_range(
-    low_rot: usize,
-    high_rot: usize,
+fn find_correction_range(
+    low_rot: f64,
+    high_rot: f64,
     dim: usize,
     base: f64,
     max_position_embeddings: usize,
 ) -> (usize, usize) {
-    let low =
-        yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings).floor() as usize;
-    let high =
-        yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings).ceil() as usize;
+    let low = find_correction_dim(low_rot, dim, base, max_position_embeddings).floor() as usize;
+    let high = find_correction_dim(high_rot, dim, base, max_position_embeddings).ceil() as usize;
     (low.max(0), high.min(dim - 1))
 }
 
-fn yarn_linear_ramp_mask(
-    low: usize,
-    high: usize,
+//def linear_ramp_mask(min, max, dim):
+//    if min == max:
+//        max += 0.001  # Prevent singularity
+//
+//    linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+//    ramp_func = torch.clamp(linear_func, 0, 1)
+//    return ramp_func
+fn linear_ramp_mask(min: usize, max: usize, dim: usize) -> Result<Tensor> {
+    let delta = match min == max {
+        true => 0.001,
+        false => 0.,
+    };
+    let min = min as f64;
+    let max = max as f64 + delta;
+    let linear_func = ((Tensor::arange(0., dim as f64, &Device::Cpu)? - min)? / (max - min))?;
+    linear_func.clamp(0.0, 1.0)
+}
+
+fn get_mscale(scale: f64) -> f64 {
+    if scale <= 1.0 {
+        1.0
+    } else {
+        0.1 * scale.ln() + 1.0
+    }
+}
+
+pub struct LlamaYaRNScaledRotaryEmbedding {
     dim: usize,
-    dtype: DType,
-) -> Result<Tensor, candle_core::Error> {
-    let linear_func = (Tensor::arange(0, dim, &Device::Cpu)?.to_dtype(dtype)? - low)?;
-    let ramp_func = linear_func.clamp(0.0, 1.0)?;
-    ramp_func / (high - low)
+    max_position_embeddings: usize,
+    base: f64,
+    scale: f64,
+    original_max_position_embeddings: usize,
+    extrapolation_factor: f64,
+    attn_factor: f64,
+    beta_fast: f64,
+    beta_slow: f64,
+    inv_freq: Tensor,
+    mscale: f64,
+    cos_cached: Option<Tensor>,
+    sin_cached: Option<Tensor>,
+    max_seq_len_cached: usize,
 }
 
-fn rotate_neox(x: &Tensor) -> Result<Tensor, candle_core::Error> {
-    let last_dim = x.dim(D::Minus1)?;
-    let xs1 = x.narrow(D::Minus1, 0, last_dim / 2)?;
-    let xs2 = x.narrow(D::Minus1, last_dim / 2, last_dim - last_dim / 2)?;
-    Tensor::cat(&[&xs2.neg()?, &xs1], D::Minus1)
+impl LlamaYaRNScaledRotaryEmbedding {
+    fn new(
+        dim: usize,
+        max_position_embeddings: usize,
+        base: f64,
+        scale: f64,
+        original_max_position_embeddings: usize,
+        extrapolation_factor: f64,
+        attn_factor: f64,
+        beta_fast: f64,
+        beta_slow: f64,
+    ) -> Result<Self> {
+        // TODO: how about f32?
+        let dtype = DType::F64;
+        let device = Device::Cpu;
+        let step_tensor = Tensor::arange_step(0., dim as f64, 2., &device)?.to_dtype(dtype)?;
+        let shape = step_tensor.shape();
+        let base_tensor = Tensor::full(base as f32, shape, &device)?;
+
+        //pos_freqs = self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+        //inv_freq_extrapolation = 1.0 / pos_freqs
+        //inv_freq_interpolation = 1.0 / (self.scale * pos_freqs)
+        let pos_freqs = base_tensor.pow(&(step_tensor / (dim as f64))?)?;
+        let inv_freq_extrapolation = (1. / &pos_freqs)?;
+        let inv_freq_interpolation = (1. / (scale * &pos_freqs)?)?;
+
+        //low, high = find_correction_range(self.beta_fast, self.beta_slow, self.dim, self.base, self.original_max_position_embeddings)
+        //inv_freq_mask = (1 - linear_ramp_mask(low, high, self.dim // 2).float().to(device)) * self.extrapolation_factor # Get n-d rotational scaling corrected for extrapolation
+        //inv_freq = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
+        let (low, high) = find_correction_range(
+            beta_fast,
+            beta_slow,
+            dim,
+            base,
+            original_max_position_embeddings,
+        );
+        let inv_freq_mask = ((1. - linear_ramp_mask(low, high, dim / 2)?)? * extrapolation_factor)?;
+        let inv_freq = (inv_freq_interpolation * (1. - &inv_freq_mask)?
+            + (inv_freq_extrapolation * &inv_freq_mask)?)?;
+
+        //self.register_buffer("inv_freq", inv_freq)
+        //self.mscale = float(get_mscale(self.scale) * self.attn_factor) # Get n-d magnitude scaling corrected for interpolation
+        let mscale = get_mscale(scale) * attn_factor;
+
+        Ok(Self {
+            dim,
+            max_position_embeddings,
+            base,
+            scale,
+            original_max_position_embeddings,
+            extrapolation_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow,
+            inv_freq,
+            mscale,
+            cos_cached: None,
+            sin_cached: None,
+            max_seq_len_cached: max_position_embeddings,
+        })
+    }
+
+    //def forward(self, x, seq_len=None):
+    //    # x: [bs, num_attention_heads, seq_len, head_size]
+    //    # This `if` block is unlikely to be run after we build sin/cos in `__init__`. Keep the logic here just in case.
+    //    if seq_len > self.max_seq_len_cached:
+    //        self.max_seq_len_cached = seq_len
+
+    //        t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
+    //        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+    //        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+    //        emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+
+    //        self.register_buffer("cos_cached", (emb.cos() * self.mscale)[None, None, :, :].to(x.dtype), persistent=False)
+    //        self.register_buffer("sin_cached", (emb.sin() * self.mscale)[None, None, :, :].to(x.dtype), persistent=False)
+    //    return (
+    //        self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+    //        self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+    //    )
+    pub fn forward(&mut self, x: &Tensor, seq_len: usize) -> Result<(Tensor, Tensor)> {
+        if seq_len > self.max_seq_len_cached {
+            self.max_seq_len_cached = seq_len;
+            let t = Tensor::arange(0., self.max_seq_len_cached as f64, &Device::Cpu)?;
+            let freqs = t.unsqueeze(1)?.matmul(&self.inv_freq.unsqueeze(0)?)?;
+
+            let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
+            self.cos_cached = Some((emb.cos()? * self.mscale)?.unsqueeze(0)?.unsqueeze(0)?);
+            self.sin_cached = Some((emb.sin()? * self.mscale)?.unsqueeze(0)?.unsqueeze(0)?);
+        }
+        let cos = self
+            .cos_cached
+            .as_ref()
+            .unwrap()
+            .narrow(2, 0, seq_len)?
+            .to_dtype(x.dtype())?;
+        let sin = self
+            .sin_cached
+            .as_ref()
+            .unwrap()
+            .narrow(2, 0, seq_len)?
+            .to_dtype(x.dtype())?;
+        Ok((cos, sin))
+    }
 }
 
-fn rotate_gptj(x: &Tensor) -> Result<Tensor, candle_core::Error> {
-    let dims = x.dims();
-    let last_dim = *dims.last().unwrap() as u32;
+#[cfg(test)]
+mod tests {
+    use std::borrow::BorrowMut;
 
-    // Create index tensors for even and odd indices
-    let even_indices: Vec<u32> = (0..last_dim).step_by(2).collect();
-    let odd_indices: Vec<u32> = (1..last_dim).step_by(2).collect();
+    use candle_core::{Device, Result, Tensor};
 
-    let even_tensor = Tensor::from_vec(even_indices, (last_dim as usize / 2,), &Device::Cpu)?;
-    let odd_tensor = Tensor::from_vec(odd_indices, (last_dim as usize / 2,), &Device::Cpu)?;
+    use super::LlamaYaRNScaledRotaryEmbedding;
 
-    // Use index_select to get even and odd elements
-    let x1 = x.index_select(&even_tensor, dims.len() - 1)?;
-    let x2 = x.index_select(&odd_tensor, dims.len() - 1)?;
+    #[test]
+    fn test() -> Result<()> {
+        //dim = 128
+        //max_position_embeddings = 2048
+        //base = 10000
+        //scale = 1
+        //original_max_position_embeddings = 2048
+        //extrapolation_factor = 1
+        //attn_factor = 1
+        //beta_fast = 32
+        //beta_slow = 1
+        //finetuned = False
+        //device = None
+        //
+        //rotary_emb = LlamaYaRNScaledRotaryEmbedding(dim, max_position_embeddings, base, scale, original_max_position_embeddings, extrapolation_factor, attn_factor, beta_fast, beta_slow, finetuned, device)
+        //
+        //# Mock data for forward pass
+        //x = torch.randn(2, 8, 16, 64)  # Example input: [bs, num_attention_heads, seq_len, head_size]
+        //seq_len = 16
+        //
+        //cos, sin = rotary_emb(x, seq_len)
+        //
+        //print(cos.shape, sin.shape)
+        //
+        let dim = 128;
+        let max_position_embeddings = 2048;
+        let base = 10000.;
+        let scale = 1.;
+        let original_max_position_embeddings = 2048;
+        let extrapolation_factor = 1.;
+        let attn_factor = 1.;
+        let beta_fast = 32.;
+        let beta_slow = 1.;
 
-    // Negate x2
-    let neg_x2 = x2.neg()?;
-
-    // Stack -x2 and x1
-    let stacked = Tensor::stack(&[neg_x2, x1], dims.len() - 1)?;
-
-    // Flatten the last two dimensions
-    let new_shape: Vec<usize> = dims[..dims.len() - 1]
-        .iter()
-        .chain(&[last_dim as usize])
-        .copied()
-        .collect();
-
-    stacked.reshape(new_shape)
+        let mut rotary_emb = LlamaYaRNScaledRotaryEmbedding::new(
+            dim,
+            max_position_embeddings,
+            base,
+            scale,
+            original_max_position_embeddings,
+            extrapolation_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow,
+        )?;
+        //x = torch.randn(2, 8, 16, 64)  # Example input: [bs, num_attention_heads, seq_len, head_size]
+        //seq_len = 16
+        //cos, sin = rotary_emb(x, seq_len)
+        let x = Tensor::randn(5., 1., (2, 8, 16, 64), &Device::Cpu)?;
+        let (sin, cos) = rotary_emb.borrow_mut().forward(&x, 16)?;
+        println!("sin: {:?}", sin);
+        println!("cos: {:?}", cos);
+        Ok(())
+    }
 }

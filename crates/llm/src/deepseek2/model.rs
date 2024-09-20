@@ -11,7 +11,7 @@ use candle_transformers::{
     utils::repeat_kv,
 };
 
-use super::rotary_embedding::DeepseekScalingRotaryEmbedding;
+use super::rotary_embedding::{DeepseekScalingRotaryEmbedding, LlamaYaRNScaledRotaryEmbedding};
 
 #[derive(Debug, Clone)]
 struct DeepSeekV2MLP {
@@ -226,16 +226,14 @@ impl Attention {
             vb.pp("o_proj"),
         )?;
         let rope_scaling = cfg.rope_scaling;
-        let rotary_emb = DeepseekScalingRotaryEmbedding::new(
+        let rotary_emb = LlamaYaRNScaledRotaryEmbedding::new(
             cfg.qk_rope_head_dim,
             cfg.qk_rope_head_dim,
             cfg.max_position_embeddings,
             cfg.rope_theta,
-            false,
+            rope_scaling.original_max_position_embeddings,
             rope_scaling.factor,
-            dtype,
-            1.,
-            1.,
+            rope_scaling.,
             rope_scaling.beta_fast,
             rope_scaling.beta_slow,
             1.,

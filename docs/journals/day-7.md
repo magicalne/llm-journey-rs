@@ -1,6 +1,6 @@
 ---
 title: "Day Seven"
-date: 2024-09-119
+date: 2024-09-19
 ---
 
 # Day Seven
