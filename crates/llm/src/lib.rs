@@ -1,5 +1,6 @@
 pub mod config;
 pub mod deepseek2;
+pub mod utils;
 
 #[cfg(test)]
 mod tests {
