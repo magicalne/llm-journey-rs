@@ -1,5 +1,10 @@
 use candle_nn::Activation;
 
+#[derive(Debug, Clone)]
+pub enum TopkMethod {
+    Greedy,
+    GroupLimitedGreedy,
+}
 // https://huggingface.co/deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct/blob/main/config.json
 #[derive(Debug, Clone)]
 pub struct RopeScaling {
@@ -51,7 +56,7 @@ pub struct ModelConfig {
     pub seq_aux: bool,
     pub tie_word_embeddings: bool,
     pub topk_group: usize,
-    pub topk_method: String,
+    pub topk_method: TopkMethod,
     pub torch_dtype: String,
     pub transformers_version: String,
     pub use_cache: bool,
@@ -111,7 +116,7 @@ impl ModelConfig {
             seq_aux: true,
             tie_word_embeddings: false,
             topk_group: 1,
-            topk_method: "greedy".to_string(),
+            topk_method: TopkMethod::Greedy,
             torch_dtype: "bfloat16".to_string(),
             transformers_version: "4.39.3".to_string(),
             use_cache: true,

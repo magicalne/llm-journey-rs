@@ -1,6 +1,9 @@
 use std::{any::Any, ops::Mul, sync::Arc};
 
-use crate::deepseek2::{config::ModelConfig, rotary_embedding::apply_rotary_pos_emb};
+use crate::{
+    deepseek2::{config::ModelConfig, rotary_embedding::apply_rotary_pos_emb},
+    utils::{masked_fill, scatter, topk},
+};
 use candle_core::{self, quantized::gguf_file, DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{ops::softmax_last_dim, rotary_emb, Activation, Dropout, Embedding, LayerNorm};
 use candle_transformers::{
@@ -10,7 +13,10 @@ use candle_transformers::{
     utils::repeat_kv,
 };
 
-use super::rotary_embedding::{yarn_get_mscale, LlamaYaRNScaledRotaryEmbedding};
+use super::{
+    config::TopkMethod,
+    rotary_embedding::{yarn_get_mscale, LlamaYaRNScaledRotaryEmbedding},
+};
 
 type Cache = (Tensor, Tensor);
 
@@ -69,6 +75,7 @@ struct MoEGateConfig {
     hidden_size: usize,
 }
 
+#[derive(Debug, Clone)]
 struct MoEGate {
     weight: Linear,
 }
@@ -84,8 +91,7 @@ impl MoEGate {
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let logits = self.weight.forward(hidden_states)?;
         let scores = softmax_last_dim(&logits)?;
-        // TODO: select experts from score with different `topk_method`
-        // https://github.com/huggingface/candle/blob/d01207dbf3fb0ad614e7915c8f5706fbc09902fb/candle-transformers/src/models/mixtral.rs#L288
+        Ok(scores)
     }
 }
 
@@ -93,7 +99,7 @@ impl MoEGate {
 struct DeepseekV2Moe {
     config: ModelConfig,
     num_experts_per_tok: usize,
-    gate: Linear,
+    gate: MoEGate,
     experts: Vec<DeepSeekV2MLP>,
     shared_experts: DeepSeekV2MLP,
 }
@@ -103,7 +109,7 @@ impl DeepseekV2Moe {
         let ep_size = 1;
         let expert_per_rank = cfg.n_routed_experts;
         let ep_rank = 0;
-        let gate = linear_no_bias(cfg.hidden_size, cfg.n_routed_experts, vb.pp("gate"))?;
+        let gate = MoEGate::new(cfg, vb.pp("gate"))?;
         let mut experts = Vec::with_capacity(cfg.n_routed_experts);
         for idx in 0..cfg.n_routed_experts {
             let vb = vb.pp("experts");
@@ -121,64 +127,57 @@ impl DeepseekV2Moe {
             shared_experts,
         })
     }
+
+    fn moe_infer(
+        &self,
+        hidden_states: &Tensor,
+        topk_idx: &Tensor,
+        topk_weight: &Tensor,
+    ) -> Result<Tensor> {
+        todo!()
+    }
 }
 
 impl Module for DeepseekV2Moe {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (b_size, seq_len, hidden_dim) = xs.dims3()?;
-        let xs = xs.reshape(((), hidden_dim))?;
-        let router_logits = xs.apply(&self.gate)?;
-        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
-
-        // In order to extract topk, we extract the data from the tensor and manipulate it
-        // directly. Maybe we will want to use some custom ops instead at some point.
-        let routing_weights = routing_weights.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let (b_size, seq_len, hidden_dim) = hidden_states.dims3()?;
+        let hidden_states = hidden_states.reshape(((), hidden_dim))?;
+        let scores = self.gate.forward(&hidden_states)?;
 
         // routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         // top_x contains the row indexes to evaluate for each expert.
-        let mut top_x = vec![vec![]; self.experts.len()];
-        let mut selected_rws = vec![vec![]; self.experts.len()];
-        for (row_idx, rw) in routing_weights.iter().enumerate() {
-            let mut dst = (0..rw.len() as u32).collect::<Vec<u32>>();
-            dst.sort_by(|&i, &j| rw[j as usize].total_cmp(&rw[i as usize]));
-            let mut sum_routing_weights = 0f32;
-            for &expert_idx in dst.iter().take(self.num_experts_per_tok) {
-                let expert_idx = expert_idx as usize;
-                let routing_weight = rw[expert_idx];
-                sum_routing_weights += routing_weight;
-                top_x[expert_idx].push(row_idx as u32);
-            }
-            for &expert_idx in dst.iter().take(self.num_experts_per_tok) {
-                let expert_idx = expert_idx as usize;
-                let routing_weight = rw[expert_idx];
-                selected_rws[expert_idx].push(routing_weight / sum_routing_weights)
-            }
-        }
+        let (topk_weights, topk_idx) = match self.config.topk_method {
+            TopkMethod::Greedy => topk(&scores, self.config.num_experts_per_tok)?,
+            TopkMethod::GroupLimitedGreedy => {
+                let group_scores = scores
+                    .reshape((b_size * seq_len, self.config.n_group, ()))?
+                    .max(D::Minus1)?; // [n, n_group]
+                let (group_idx, _) = topk(&group_scores, self.config.topk_group)?; // [n, top_k_group]
+                let mut group_mask = &group_scores.zeros_like()?; // [n, n_group]
 
-        // routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        // expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+                let group_mask = scatter(&group_mask, 1, &group_idx, 1.)?;
+                let score_mask = group_mask
+                    .unsqueeze(D::Minus1)?
+                    .expand((
+                        b_size * seq_len,
+                        self.config.n_group,
+                        self.config.n_routed_experts / self.config.n_group,
+                    ))?
+                    .reshape((b_size * seq_len, ()))?; // [n, e]
 
-        let mut ys = xs.zeros_like()?;
-        for (expert_idx, expert_layer) in self.experts.iter().enumerate() {
-            let top_x = &top_x[expert_idx];
-            if top_x.is_empty() {
-                continue;
+                let tmp_scores = masked_fill(&scores, &score_mask, 0.)?;
+                topk(&tmp_scores, self.config.num_experts_per_tok)?
             }
-            let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
-            let selected_rws =
-                Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?.reshape(((), 1))?;
-            // Index the correct hidden states and compute the expert hidden state for
-            // the current expert. We need to make sure to multiply the output hidden
-            // states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            let current_state = xs.index_select(&top_x, 0)?.reshape(((), hidden_dim))?;
-            // current_hidden_states = expert_layer(current_state, routing_weights[top_x_list, idx_list, None])
-            let current_hidden_states = expert_layer.forward(&current_state)?;
-            let current_hidden_states = current_hidden_states.broadcast_mul(&selected_rws)?;
-            ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
-        }
-
-        let ys = ys.reshape((b_size, seq_len, hidden_dim))?;
-        Ok(ys)
+        };
+        let topk_weight = if self.config.num_experts_per_tok > 1 && self.config.norm_topk_prob {
+            let denominator = (topk_weights.sum_keepdim(D::Minus1)? + 1e-20)?;
+            (topk_weights / denominator)?
+        } else {
+            (topk_weights * self.config.routed_scaling_factor)?
+        };
+        let y = self.moe_infer(&hidden_states, &topk_idx, &topk_weight)?;
+        // TODO: shared experts
+        Ok(y)
     }
 }
 
@@ -591,12 +590,23 @@ impl DeepseekV2DecoderLayer {
         &mut self,
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
-        seqlen_offset: usize,
+
+        position_ids: &Tensor,
+        past_key_value: Option<&mut Cache>,
+        output_attentions: bool,
+        use_cache: bool,
+        cache_position: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
-        let xs = self
-            .self_attn
-            .forward(&hidden_states, attention_mask, seqlen_offset)?;
+        let xs = self.self_attn.forward(
+            &hidden_states,
+            attention_mask,
+            position_ids,
+            past_key_value,
+            output_attentions,
+            use_cache,
+            cache_position,
+        )?;
         let xs = self.input_layernorm.forward(hidden_states)?;
         let xs = (xs + residual)?;
         let residual = &xs;
