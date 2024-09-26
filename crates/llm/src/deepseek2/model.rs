@@ -5,7 +5,10 @@ use crate::{
     utils::{masked_fill, scatter, topk},
 };
 use candle_core::{self, quantized::gguf_file, DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::{ops::softmax_last_dim, rotary_emb, Activation, Dropout, Embedding, LayerNorm};
+use candle_nn::{
+    ops::{softmax_last_dim, Identity},
+    rotary_emb, Activation, Dropout, Embedding, LayerNorm,
+};
 use candle_transformers::{
     models::quantized_llama,
     quantized_nn::{linear_b, linear_no_bias, Linear, RmsNorm},
@@ -106,9 +109,9 @@ struct DeepseekV2Moe {
 
 impl DeepseekV2Moe {
     fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
-        let ep_size = 1;
-        let expert_per_rank = cfg.n_routed_experts;
-        let ep_rank = 0;
+        // let ep_size = 1;
+        // let expert_per_rank = cfg.n_routed_experts;
+        // let ep_rank = 0;
         let gate = MoEGate::new(cfg, vb.pp("gate"))?;
         let mut experts = Vec::with_capacity(cfg.n_routed_experts);
         for idx in 0..cfg.n_routed_experts {
@@ -131,15 +134,61 @@ impl DeepseekV2Moe {
     fn moe_infer(
         &self,
         hidden_states: &Tensor,
-        topk_idx: &Tensor,
+        topk_ids: &Tensor,
         topk_weight: &Tensor,
     ) -> Result<Tensor> {
-        todo!()
+        let device = hidden_states.device();
+
+        let mut cnts = Tensor::zeros((topk_ids.dim(0)?, self.experts.len()), DType::U32, device)?;
+        let cnts = scatter(&cnts, 1, topk_ids, 1.)?;
+
+        let tokens_per_expert = cnts.sum_keepdim(0)?;
+        let idxs = topk_ids.arg_sort_last_dim(false)?;
+        let idxs = (idxs.to_dtype(DType::F64)? / (topk_ids.dims2()?.1 as f64))?;
+        let idxs = idxs.to_dtype(DType::U32)?;
+
+        let sorted_tokens = hidden_states.i(&idxs)?;
+        let tokens_per_expert = tokens_per_expert.to_vec1::<u32>()?; // TODO: is this dtype right?
+
+        let mut outputs = Vec::new();
+        let mut start_idx = 0;
+
+        for (i, &num_tokens) in tokens_per_expert.iter().enumerate() {
+            let end_idx = start_idx + num_tokens as usize;
+            if num_tokens == 0 {
+                continue;
+            }
+            let expert = &self.experts[i];
+            let tokens_for_this_expert = sorted_tokens.i(start_idx..end_idx)?;
+            let expert_out = expert.forward(&tokens_for_this_expert)?;
+            outputs.push(expert_out);
+            start_idx = end_idx;
+        }
+
+        let outs = if !outputs.is_empty() {
+            Tensor::cat(&outputs, 0)?
+        } else {
+            unsafe { sorted_tokens.empty_like()? }
+        };
+
+        let new_x = unsafe { Tensor::empty_like(&outs)? };
+
+        new_x.scatter_add(&idxs, &outs, 0)?;
+
+        let final_out = new_x
+            .reshape((topk_ids.dim(0)?, topk_ids.dim(1)?, ()))?
+            .to_dtype(topk_weight.dtype())?
+            .mul(topk_weight.unsqueeze(D::Minus1)?)?
+            .sum(1)?
+            .to_dtype(new_x.dtype())?;
+
+        Ok(final_out)
     }
 }
 
 impl Module for DeepseekV2Moe {
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let identity = hidden_states;
         let (b_size, seq_len, hidden_dim) = hidden_states.dims3()?;
         let hidden_states = hidden_states.reshape(((), hidden_dim))?;
         let scores = self.gate.forward(&hidden_states)?;
@@ -176,7 +225,7 @@ impl Module for DeepseekV2Moe {
             (topk_weights * self.config.routed_scaling_factor)?
         };
         let y = self.moe_infer(&hidden_states, &topk_idx, &topk_weight)?;
-        // TODO: shared experts
+        let y = (y + self.shared_experts.forward(identity)?)?;
         Ok(y)
     }
 }
@@ -573,9 +622,9 @@ impl DeepseekV2DecoderLayer {
             && layer_id > cfg.first_k_dense_replace
             && layer_id % cfg.moe_layer_freq == 0
         {
-            MLP::new_moe(cfg, vb)?
+            MLP::new_moe(cfg, mlp_vb)?
         } else {
-            MLP::new_mlp(cfg, vb)?
+            MLP::new_mlp(cfg, mlp_vb)?
         };
         Ok(Self {
             hidden_size: cfg.hidden_size,
@@ -590,15 +639,15 @@ impl DeepseekV2DecoderLayer {
         &mut self,
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
-
         position_ids: &Tensor,
         past_key_value: Option<&mut Cache>,
         output_attentions: bool,
         use_cache: bool,
         cache_position: Option<&Tensor>,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<Tensor>, Option<Cache>)> {
         let residual = hidden_states;
-        let xs = self.self_attn.forward(
+        let hidden_states = self.input_layernorm.forward(hidden_states)?;
+        let (hidden_states, self_attn_weights, present_key_value) = self.self_attn.forward(
             &hidden_states,
             attention_mask,
             position_ids,
@@ -607,16 +656,24 @@ impl DeepseekV2DecoderLayer {
             use_cache,
             cache_position,
         )?;
-        let xs = self.input_layernorm.forward(hidden_states)?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
-        Ok((residual + xs)?)
+        let hidden_states = (residual + hidden_states)?;
+        // Fully Connected
+        let residual = &hidden_states;
+        let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
+        let hidden_states = self.mlp.forward(&hidden_states)?;
+
+        let hidden_states = (residual + hidden_states)?;
+        let cache = match use_cache {
+            true => Some(present_key_value),
+            false => None,
+        };
+        Ok((hidden_states, self_attn_weights, cache))
     }
 }
 
 pub struct Model {
-    token_embeddings: Embedding,
+    config: ModelConfig,
+    embed_tokens: Embedding,
     norm: RmsNorm,
     layers: Vec<DeepseekV2DecoderLayer>,
 }
@@ -626,7 +683,7 @@ impl Model {
         let weights = vb.get_no_shape("token_embd.weight")?;
         let _dtype = weights.dtype();
         let weights = weights.dequantize(device)?;
-        let token_embeddings = Embedding::new(weights, config.hidden_size);
+        let embed_tokens = Embedding::new(weights, config.hidden_size);
         let norm = RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let vb_l = vb.pp("layers");
@@ -634,13 +691,17 @@ impl Model {
             let layer = DeepseekV2DecoderLayer::new(config, layer_idx, vb_l.pp(layer_idx), device)?;
             layers.push(layer)
         }
-        //
 
         Ok(Self {
-            token_embeddings,
+            config: config.clone(),
+            embed_tokens,
             norm,
             layers,
         })
+    }
+
+    pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        todo!()
     }
 }
 

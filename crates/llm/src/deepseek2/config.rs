@@ -65,7 +65,7 @@ pub struct ModelConfig {
     pub use_flash_attn: bool,
 
     // training configs
-    pub ep_size: Option<usize>,
+    pub ep_size: usize,
 }
 
 impl ModelConfig {
@@ -123,7 +123,7 @@ impl ModelConfig {
             v_head_dim: 128,
             vocab_size: 102400,
             use_flash_attn: true,
-            ep_size: None,
+            ep_size: 1,
         }
     }
 }
