@@ -1,10 +1,14 @@
-use std::{any::Any, ops::Mul, sync::Arc};
+use std::{any::Any, collections::HashMap, ops::Mul, sync::Arc};
 
 use crate::{
     deepseek2::{config::ModelConfig, rotary_embedding::apply_rotary_pos_emb},
     utils::{masked_fill, scatter, topk},
 };
-use candle_core::{self, quantized::gguf_file, DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle_core::{
+    self,
+    quantized::{gguf_file, QMatMul, QTensor},
+    Context, DType, Device, IndexOp, Module, Result, Tensor, D,
+};
 use candle_nn::{
     ops::{softmax_last_dim, Identity},
     rotary_emb, Activation, Dropout, Embedding, LayerNorm,
@@ -25,9 +29,6 @@ type Cache = (Tensor, Tensor);
 
 #[derive(Debug, Clone)]
 struct DeepSeekV2MLP {
-    config: ModelConfig,
-    hidden_size: usize,
-    intermediate_size: usize,
     gate_proj: Linear,
     down_proj: Linear,
     up_proj: Linear,
@@ -35,16 +36,17 @@ struct DeepSeekV2MLP {
 }
 
 impl DeepSeekV2MLP {
-    fn new(cfg: &ModelConfig, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
-        let hidden_size = cfg.hidden_size;
-        let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
-        let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
+    fn new(
+        down_proj: Linear,
+        gate_proj: Linear,
+        up_proj: Linear,
+        act_fn: Activation,
+    ) -> Result<Self> {
+        //let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
+        //let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
+        //let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
         Ok(Self {
-            config: cfg.clone(),
-            act_fn: cfg.hidden_act,
-            hidden_size,
-            intermediate_size,
+            act_fn,
             gate_proj,
             down_proj,
             up_proj,
@@ -86,7 +88,7 @@ struct MoEGate {
 impl MoEGate {
     fn new(config: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let gating_dim = config.hidden_size;
-        let weight = linear_no_bias(config.n_routed_experts, gating_dim, vb.pp("gate"))?;
+        let weight = linear_no_bias(gating_dim, config.n_routed_experts, vb.pp("ffn_gate_inp"))?;
         let gate = MoEGate { weight };
         Ok(gate)
     }
@@ -112,16 +114,77 @@ impl DeepseekV2Moe {
         // let ep_size = 1;
         // let expert_per_rank = cfg.n_routed_experts;
         // let ep_rank = 0;
-        let gate = MoEGate::new(cfg, vb.pp("gate"))?;
+        let gate = MoEGate::new(cfg, vb.clone()).context("MoeGate")?; // gate
+
         let mut experts = Vec::with_capacity(cfg.n_routed_experts);
+        let s = (
+            cfg.n_routed_experts,
+            cfg.hidden_size,
+            cfg.moe_intermediate_size,
+        );
+        let device = &Device::Cpu;
+        let ffn_down_exps = vb.get(s, "ffn_down_exps.weight")?;
+        let ffn_down_exps_dtype = ffn_down_exps.dtype();
+        let ffn_down_exps = ffn_down_exps
+            .dequantize(device)?
+            .chunk(cfg.n_routed_experts, 0)?;
+        let s = (
+            cfg.n_routed_experts,
+            cfg.moe_intermediate_size,
+            cfg.hidden_size,
+        );
+        let ffn_gate_exps = vb.get(s, "ffn_gate_exps.weight")?;
+        let ffn_gate_exps_dtype = ffn_gate_exps.dtype();
+        let ffn_gate_exps = ffn_gate_exps
+            .dequantize(device)?
+            .chunk(cfg.n_routed_experts, 0)?;
+        let ffn_up_exps = vb.get(s, "ffn_up_exps.weight")?;
+        let ffn_up_exps_dtype = ffn_up_exps.dtype();
+        let ffn_up_exps = ffn_up_exps
+            .dequantize(device)?
+            .chunk(cfg.n_routed_experts, 0)?;
+        dbg!(1);
+
+        let hidden_act = cfg.hidden_act;
         for idx in 0..cfg.n_routed_experts {
-            let vb = vb.pp("experts");
-            let expert = DeepSeekV2MLP::new(cfg, cfg.moe_intermediate_size, vb.pp(idx))?;
+            dbg!(idx);
+            let down =
+                QTensor::quantize(&ffn_down_exps[idx], ffn_down_exps_dtype).context("down")?;
+            let gate =
+                QTensor::quantize(&ffn_gate_exps[idx], ffn_gate_exps_dtype).context("gate")?;
+            let up = QTensor::quantize(&ffn_up_exps[idx], ffn_up_exps_dtype).context("up")?;
+            let gate_proj = Linear::from_arc(Arc::new(gate), None).context("gate_proj")?;
+            let down_proj = Linear::from_arc(Arc::new(down), None).context("down_proj")?;
+            let up_proj = Linear::from_arc(Arc::new(up), None).context("up_proj")?;
+            let expert = DeepSeekV2MLP::new(down_proj, gate_proj, up_proj, hidden_act)?;
             experts.push(expert)
         }
+
+        dbg!(2);
         let vb = vb.pp("shared_experts");
         let intermediate_size = cfg.moe_intermediate_size * cfg.n_shared_experts;
-        let shared_experts = DeepSeekV2MLP::new(cfg, intermediate_size, vb)?;
+        let ffn_down_shexp = vb.get(
+            (intermediate_size, cfg.hidden_size),
+            "ffn_down_shexp.weight",
+        )?;
+        let ffn_down_shexp_dtype = ffn_down_shexp.dtype();
+        let ffn_down_shexp = ffn_down_shexp.dequantize(device)?;
+        let s = (cfg.hidden_size, intermediate_size);
+        let ffn_gate_shexp = vb.get(s, "ffn_gate_shexp.weight")?;
+        let ffn_gate_shexp_dtype = ffn_gate_shexp.dtype();
+        let ffn_gate_shexp = ffn_gate_shexp.dequantize(device)?;
+        let ffn_up_shexp = vb.get(s, "ffn_up_shexp.weight")?;
+        let ffn_up_shexp_dtype = ffn_up_shexp.dtype();
+        let ffn_up_shexp = ffn_up_shexp.dequantize(device)?;
+        let ffn_down_shexp = QTensor::quantize(&ffn_down_shexp, ffn_down_shexp_dtype)?;
+        let ffn_gate_shexp = QTensor::quantize(&ffn_gate_shexp, ffn_gate_shexp_dtype)?;
+        let ffn_up_shexp = QTensor::quantize(&ffn_up_shexp, ffn_up_shexp_dtype)?;
+        let gate_proj = Linear::from_arc(Arc::new(ffn_gate_shexp), None)?;
+        let down_proj = Linear::from_arc(Arc::new(ffn_down_shexp), None)?;
+        let up_proj = Linear::from_arc(Arc::new(ffn_up_shexp), None)?;
+        dbg!(3);
+
+        let shared_experts = DeepSeekV2MLP::new(down_proj, gate_proj, up_proj, hidden_act)?;
         Ok(DeepseekV2Moe {
             config: cfg.clone(),
             num_experts_per_tok: cfg.num_experts_per_tok,
@@ -139,7 +202,7 @@ impl DeepseekV2Moe {
     ) -> Result<Tensor> {
         let device = hidden_states.device();
 
-        let mut cnts = Tensor::zeros((topk_ids.dim(0)?, self.experts.len()), DType::U32, device)?;
+        let cnts = Tensor::zeros((topk_ids.dim(0)?, self.experts.len()), DType::U32, device)?;
         let cnts = scatter(&cnts, 1, topk_ids, 1.)?;
 
         let tokens_per_expert = cnts.sum_keepdim(0)?;
@@ -168,10 +231,12 @@ impl DeepseekV2Moe {
         let outs = if !outputs.is_empty() {
             Tensor::cat(&outputs, 0)?
         } else {
-            unsafe { sorted_tokens.empty_like()? }
+            sorted_tokens.zeros_like()?
+            //unsafe { sorted_tokens.empty_like()? }
         };
 
-        let new_x = unsafe { Tensor::empty_like(&outs)? };
+        let new_x = outs.zeros_like()?;
+        //let new_x = unsafe { Tensor::empty_like(&outs)? };
 
         new_x.scatter_add(&idxs, &outs, 0)?;
 
@@ -202,9 +267,9 @@ impl Module for DeepseekV2Moe {
                     .reshape((b_size * seq_len, self.config.n_group, ()))?
                     .max(D::Minus1)?; // [n, n_group]
                 let (group_idx, _) = topk(&group_scores, self.config.topk_group)?; // [n, top_k_group]
-                let mut group_mask = &group_scores.zeros_like()?; // [n, n_group]
+                let group_mask = &group_scores.zeros_like()?; // [n, n_group]
 
-                let group_mask = scatter(&group_mask, 1, &group_idx, 1.)?;
+                let group_mask = scatter(group_mask, 1, &group_idx, 1.)?;
                 let score_mask = group_mask
                     .unsqueeze(D::Minus1)?
                     .expand((
@@ -265,7 +330,7 @@ impl AttentionType {
                 let q_proj = linear_no_bias(
                     cfg.hidden_size,
                     cfg.num_attention_heads * qk_head_dim,
-                    vb.pp("q_proj"),
+                    vb.pp("attn_q"), // q_proj
                 )?;
                 Self::Lite { q_proj }
             }
@@ -281,7 +346,7 @@ impl AttentionType {
             } => Err(candle_core::Error::Msg(
                 "q_proj is in LITE model only.".to_string(),
             )),
-            AttentionType::Lite { q_proj } => Ok(&q_proj),
+            AttentionType::Lite { q_proj } => Ok(q_proj),
         }
     }
 
@@ -338,28 +403,28 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(cfg: &ModelConfig, layer_id: usize, vb: VarBuilder, device: &Device) -> Result<Self> {
+    fn new(cfg: &ModelConfig, layer_id: usize, vb: VarBuilder, _device: &Device) -> Result<Self> {
         let q_type = AttentionType::new(cfg, vb.clone())?;
         let q_head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
         let kv_a_proj_with_mqa = linear_no_bias(
             cfg.hidden_size,
             cfg.kv_lora_rank + cfg.qk_rope_head_dim,
-            vb.pp("kv_a_proj_with_mqa"),
+            vb.pp("attn_kv_a_mqa"), //kv_a_proj_with_mqa
         )?;
         let kv_a_layernorm =
-            RmsNorm::new(cfg.kv_lora_rank, cfg.rms_norm_eps, vb.pp("kv_a_layernorm"))?;
+            RmsNorm::new(cfg.kv_lora_rank, cfg.rms_norm_eps, vb.pp("attn_kv_a_norm"))?; //kv_a_layernorm
         let out_dim = cfg.num_attention_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim);
         let kv_b_proj = linear_b(
             cfg.kv_lora_rank,
             out_dim,
             cfg.attention_bias,
-            vb.pp("kv_b_proj"),
+            vb.pp("attn_kv_b"), //kv_b_proj
         )?;
         let o_proj = linear_b(
             cfg.num_attention_heads * cfg.v_head_dim,
             cfg.hidden_size,
             cfg.attention_bias,
-            vb.pp("o_proj"),
+            vb.pp("attn_output"), //o_proj
         )?;
         let rope_scaling = &cfg.rope_scaling;
         let rotary_emb = LlamaYaRNScaledRotaryEmbedding::new(
@@ -400,10 +465,10 @@ impl Attention {
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
         position_ids: &Tensor,
-        past_key_value: Option<&mut Cache>,
+        _past_key_value: Option<&Cache>,
         output_attentions: bool,
-        use_cache: bool,
-        cache_position: Option<&Tensor>,
+        _use_cache: bool,
+        _cache_position: Option<&Tensor>,
     ) -> Result<(Tensor, Option<Tensor>, Cache)> {
         let dims = hidden_states.dims();
         let bsz = dims[0];
@@ -467,33 +532,27 @@ impl Attention {
         let (cos, sin) = self.rotary_emb.forward(&q_pe, position_ids)?;
         let (q_pe, k_pe) = apply_rotary_pos_emb(&q_pe, &k_pe, &cos, &sin, None)?;
 
-        let mut query_states = Tensor::zeros(
+        let query_states = Tensor::zeros(
             (bsz, self.config.num_attention_heads, q_len, self.q_head_dim),
             hidden_states.dtype(),
             hidden_states.device(),
         )?;
         query_states.slice_assign(
-            &[&(..), &(..), &(..), &(..self.config.qk_nope_head_dim)],
+            &[(..), (..), (..), (..self.config.qk_nope_head_dim)],
             &q_nope,
         )?;
-        query_states.slice_assign(
-            &[&(..), &(..), &(..), &(self.config.qk_nope_head_dim..)],
-            &q_pe,
-        )?;
+        query_states.slice_assign(&[(..), (..), (..), (self.config.qk_nope_head_dim..)], &q_pe)?;
 
-        let mut key_states = Tensor::zeros(
+        let key_states = Tensor::zeros(
             (bsz, self.config.num_attention_heads, q_len, self.q_head_dim),
             hidden_states.dtype(),
             hidden_states.device(),
         )?;
         key_states.slice_assign(
-            &[&(..), &(..), &(..), &(..self.config.qk_nope_head_dim)],
+            &[(..), (..), (..), (..self.config.qk_nope_head_dim)],
             &k_nope,
         )?;
-        key_states.slice_assign(
-            &[&(..), &(..), &(..), &(self.config.qk_nope_head_dim..)],
-            &k_pe,
-        )?;
+        key_states.slice_assign(&[(..), (..), (..), (self.config.qk_nope_head_dim..)], &k_pe)?;
 
         /*
          * TODO: kvcache
@@ -580,10 +639,19 @@ impl MLP {
     }
 
     fn new_mlp(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+        let intermediate_size = cfg.intermediate_size;
+
+        let gate = linear_no_bias(cfg.hidden_size, intermediate_size, vb.pp("ffn_gate"))
+            .context("ffn_gate")?;
+        let up = linear_no_bias(cfg.hidden_size, intermediate_size, vb.pp("ffn_up"))
+            .context("ffn_up")?;
+        let down = linear_no_bias(intermediate_size, cfg.hidden_size, vb.pp("ffn_down"))
+            .context("ffn_down")?;
         Ok(Self::Mlp(DeepSeekV2MLP::new(
-            cfg,
-            cfg.intermediate_size,
-            vb,
+            down,
+            gate,
+            up,
+            cfg.hidden_act,
         )?))
     }
 }
@@ -608,23 +676,24 @@ struct DeepseekV2DecoderLayer {
 
 impl DeepseekV2DecoderLayer {
     fn new(cfg: &ModelConfig, layer_id: usize, vb: VarBuilder, device: &Device) -> Result<Self> {
-        let self_attn = Attention::new(cfg, layer_id, vb.pp("self_attn"), device)?;
-        let input_layernorm =
-            RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+        // model.layer.index.self_attn
+        let self_attn = Attention::new(cfg, layer_id, vb.clone(), device)?;
+        let input_layernorm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("attn_norm"))?; //input_layernorm
         let post_attention_layernorm = RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
+            vb.pp("ffn_norm"), //post_attention_layernorm
+        )
+        .context("post_attention_layernorm")?;
 
-        let mlp_vb = vb.pp("mlp");
+        let mlp_vb = vb.clone(); //mlp
         let mlp = if cfg.n_routed_experts > 0
-            && layer_id > cfg.first_k_dense_replace
+            && layer_id >= cfg.first_k_dense_replace
             && layer_id % cfg.moe_layer_freq == 0
         {
-            MLP::new_moe(cfg, mlp_vb)?
+            MLP::new_moe(cfg, mlp_vb).context("new_moe")?
         } else {
-            MLP::new_mlp(cfg, mlp_vb)?
+            MLP::new_mlp(cfg, mlp_vb).context("new_mlp")?
         };
         Ok(Self {
             hidden_size: cfg.hidden_size,
@@ -636,11 +705,11 @@ impl DeepseekV2DecoderLayer {
     }
 
     fn forward(
-        &mut self,
+        &self,
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
         position_ids: &Tensor,
-        past_key_value: Option<&mut Cache>,
+        past_key_value: Option<&Cache>,
         output_attentions: bool,
         use_cache: bool,
         cache_position: Option<&Tensor>,
@@ -684,9 +753,13 @@ impl Model {
         let _dtype = weights.dtype();
         let weights = weights.dequantize(device)?;
         let embed_tokens = Embedding::new(weights, config.hidden_size);
-        let norm = RmsNorm::new(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
+        let norm = RmsNorm::new(
+            config.hidden_size,
+            config.rms_norm_eps,
+            vb.pp("output_norm"),
+        )?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        let vb_l = vb.pp("layers");
+        let vb_l = vb.pp("blk");
         for layer_idx in 0..config.num_hidden_layers {
             let layer = DeepseekV2DecoderLayer::new(config, layer_idx, vb_l.pp(layer_idx), device)?;
             layers.push(layer)
@@ -700,8 +773,83 @@ impl Model {
         })
     }
 
-    pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        todo!()
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+        position_ids: &Tensor,
+        past_key_value: Option<&Cache>,
+        use_cache: bool,
+        output_attentions: bool,
+        cache_position: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let inputs_embeds = self.embed_tokens.forward(input_ids)?;
+        // TODO: attention_mask
+
+        // embed positions
+        let mut hidden_states = inputs_embeds;
+
+        // decoder layers
+        for decoder_layer in &self.layers {
+            let layer_outputs = decoder_layer.forward(
+                &hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_value,
+                output_attentions,
+                use_cache,
+                cache_position,
+            )?;
+            hidden_states = layer_outputs.0;
+        }
+        hidden_states = self.norm.forward(&hidden_states)?;
+        Ok(hidden_states)
+    }
+}
+
+pub struct CausalLM {
+    model: Model,
+    config: ModelConfig,
+    lm_head: Linear,
+}
+
+impl CausalLM {
+    pub fn new(config: &ModelConfig, device: &Device, vb: VarBuilder) -> Result<Self> {
+        let model = Model::from_gguf(config, device, vb.clone())?;
+        let lm_head = linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?;
+        Ok(Self {
+            model,
+            lm_head,
+            config: config.clone(),
+        })
+    }
+
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+        position_ids: &Tensor,
+        past_key_value: Option<&Cache>,
+        use_cache: bool,
+        output_attentions: bool,
+        cache_position: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let hidden_states = self.model.forward(
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_value,
+            use_cache,
+            output_attentions,
+            cache_position,
+        )?;
+        let logits = self.lm_head.forward(&hidden_states)?;
+        let dim = logits.dim(1)?;
+        let logits = logits
+            .i((.., dim - 1, ..))?
+            .unsqueeze(0)?
+            .to_dtype(DType::F32)?;
+        Ok(logits)
     }
 }
 
@@ -738,6 +886,5 @@ impl Module for T5LayerNorm {
 }
 
 pub fn read_gguf_file<P: AsRef<std::path::Path>>(path: P, device: &Device) -> Result<VarBuilder> {
-    let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(path, device)?;
-    Ok(vb)
+    VarBuilder::from_gguf(path, device)
 }

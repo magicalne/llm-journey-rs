@@ -88,7 +88,7 @@ impl LlamaYaRNScaledRotaryEmbedding {
         let step_tensor =
             Tensor::arange_step(0., rotary_dim as f64, 2., &device)?.to_dtype(dtype)?;
         let shape = step_tensor.shape();
-        let base_tensor = Tensor::full(base as f32, shape, &device)?;
+        let base_tensor = Tensor::full(base, shape, &device)?;
 
         //pos_freqs = self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
         //inv_freq_extrapolation = 1.0 / pos_freqs

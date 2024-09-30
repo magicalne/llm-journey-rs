@@ -40,3 +40,30 @@ pub fn masked_fill<D: WithDType>(xs: &Tensor, mask: &Tensor, value: D) -> Result
         .where_cond(&on_true, on_false)?;
     Ok(res)
 }
+
+#[cfg(test)]
+mod tests {
+    use candle_core::{Device, IndexOp, Result, Tensor};
+
+    fn split_tensor(tensor: &Tensor) -> Result<Vec<Tensor>> {
+        let mut result = Vec::new();
+        for i in 0..10 {
+            let slice = tensor.i(i)?;
+            result.push(slice);
+        }
+        Ok(result)
+    }
+    #[test]
+    fn test_i() -> Result<()> {
+        // Assume we have a tensor with shape (10, 3, 3)
+        let big_tensor = Tensor::randn(0f32, 1f32, (10, 3, 3), &Device::Cpu)?;
+
+        let tensor_list = split_tensor(&big_tensor)?;
+
+        // Now tensor_list contains 10 tensors, each with shape (3, 3)
+        for (i, t) in tensor_list.iter().enumerate() {
+            println!("Tensor {}: {:?}", i, t.shape());
+        }
+        Ok(())
+    }
+}
