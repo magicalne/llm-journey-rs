@@ -52,20 +52,8 @@ pub fn yarn_get_mscale(scale: f64, mscale: f64) -> f64 {
 
 #[derive(Debug, Clone)]
 pub struct LlamaYaRNScaledRotaryEmbedding {
-    rotary_dim: usize,
-    max_position_embeddings: usize,
-    base: f64,
-    scaling_factor: f64,
-    original_max_position_embeddings: usize,
-    extrapolation_factor: f64,
-    // attn_factor: f64, DeepSeek doesn't use this.
-    beta_fast: f64,
-    beta_slow: f64,
     inv_freq: Tensor,
     mscale: f64,
-    max_seq_len_cached: usize,
-    cache: Tensor,
-    head_size: usize,
 }
 
 impl LlamaYaRNScaledRotaryEmbedding {
@@ -116,7 +104,7 @@ impl LlamaYaRNScaledRotaryEmbedding {
             / yarn_get_mscale(scaling_factor, mscale_all_dim);
         let t = Tensor::arange(
             0.,
-            (max_position_embeddings as f64 * scaling_factor) as f64,
+            max_position_embeddings as f64 * scaling_factor,
             &Device::Cpu,
         )?;
         let freqs = t.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
@@ -124,21 +112,7 @@ impl LlamaYaRNScaledRotaryEmbedding {
         let sin = (freqs.sin()? * mscale)?;
         let cache = Tensor::cat(&[&cos, &sin], D::Minus1)?;
 
-        Ok(Self {
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            scaling_factor,
-            original_max_position_embeddings,
-            extrapolation_factor,
-            beta_fast,
-            beta_slow,
-            inv_freq,
-            mscale,
-            cache,
-            max_seq_len_cached: max_position_embeddings,
-        })
+        Ok(Self { inv_freq, mscale })
     }
 
     pub fn forward(&self, x: &Tensor, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
@@ -260,7 +234,7 @@ mod tests {
         //seq_len = 16
         //cos, sin = rotary_emb(x, seq_len)
         let x = Tensor::randn(5., 1., (2, 8, 16, 64), &Device::Cpu)?;
-        let positions = Tensor::arange(0, 16, &Device::Cpu)?;
+        let positions = Tensor::arange(0u32, 16, &Device::Cpu)?;
         let (sin, cos) = rotary_emb.borrow_mut().forward(&x, &positions)?;
         println!("sin: {:?}", sin);
         println!("cos: {:?}", cos);
