@@ -1,20 +1,13 @@
 use std::io::Write;
 use std::time::Instant;
-use std::{mem, sync::Arc};
 
-use anyhow::Context;
-use candle_core::{quantized::QTensor, Device, Tensor};
-use candle_core::{CpuStorage, Storage};
+use candle_core::{Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::{quantized_nn::Linear, quantized_var_builder::VarBuilder};
+use candle_transformers::quantized_var_builder::VarBuilder;
 use log::info;
-use rayon::prelude::*;
 use tokenizers::Tokenizer;
 
-use llm::deepseek2::{
-    config::ModelConfig,
-    model::{print_size, Model},
-};
+use llm::deepseek2::{config::ModelConfig, model::Model};
 
 const MAX_SEQ_LEN: usize = 8192;
 
@@ -33,7 +26,7 @@ fn test_lite() -> anyhow::Result<()> {
     //    .for_each(|(key, value)| println!("{}: {:?}", key, value));
 
     rayon::ThreadPoolBuilder::new()
-        .num_threads(8)
+        .num_threads(11)
         .build_global()?;
     let ts = Instant::now();
     let mut vb = VarBuilder::from_gguf(path, &device)?;
@@ -89,22 +82,12 @@ fn test_lite() -> anyhow::Result<()> {
     };
 
     let start_prompt_processing = std::time::Instant::now();
-    let mut next_token = if !split_prompt {
-        let input = Tensor::new(prompt_tokens.as_slice(), &device)?.unsqueeze(0)?;
+    let input = Tensor::new(prompt_tokens.as_slice(), &device)?.unsqueeze(0)?;
 
-        let logits = model.forward(&input, None, None, false, false, None)?;
-        let logits = logits.squeeze(0)?;
-        logits_processor.sample(&logits)?
-    } else {
-        let mut next_token = 0;
-        for (pos, token) in prompt_tokens.iter().enumerate() {
-            let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, None, None, false, false, None)?;
-            let logits = logits.squeeze(0)?;
-            next_token = logits_processor.sample(&logits)?
-        }
-        next_token
-    };
+    let logits = model.forward(&input, 0, None, false, false, None)?;
+    let logits = logits.squeeze(0)?;
+
+    let mut next_token = logits_processor.sample(&logits)?;
     let prompt_dt = start_prompt_processing.elapsed();
     all_tokens.push(next_token);
     let t = tokenizer
@@ -122,12 +105,14 @@ fn test_lite() -> anyhow::Result<()> {
     //};
 
     //let eos_token = *tos.tokenizer().get_vocab(true).get(eos_token).unwrap();
+    let mut position_index = input.dim(1)?;
     let start_post_prompt = std::time::Instant::now();
     let mut sampled = 0;
     for index in 0..to_sample {
         let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
         //let logits = model.forward(&input, prompt_tokens.len() + index)?;
-        let logits = model.forward(&input, None, None, false, false, None)?;
+        let logits = model.forward(&input, index as u32, None, false, false, None)?;
+        position_index += 1;
         let logits = logits.squeeze(0)?;
         //let logits = if args.repeat_penalty == 1. {
         //    logits

@@ -117,12 +117,22 @@ impl LlamaYaRNScaledRotaryEmbedding {
 
     pub fn forward(&self, x: &Tensor, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
         // x: [bs, num_attention_heads, seq_len, head_size]
+        //inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        //position_ids_expanded = position_ids[:, None, :].float()
         let inv_freq_expanded = self.inv_freq.unsqueeze(0)?.unsqueeze(2)?;
         let dims = inv_freq_expanded.dims();
         let inv_freq_expanded =
             inv_freq_expanded.expand(&[position_ids.shape().dims()[0], dims[1], 1])?;
-        let position_ids_expanded = position_ids.unsqueeze(1)?.unsqueeze(2)?;
+        let position_ids_expanded = position_ids.unsqueeze(1)?;
         // Force float32 since bfloat16 loses precision on long contexts
+
+        //device_type = x.device.type
+        //device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        //with torch.autocast(device_type=device_type, enabled=False):
+        //    freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+        //    emb = torch.cat((freqs, freqs), dim=-1)
+        //    cos = emb.cos()* self._mscale
+        //    sin = emb.sin()* self._mscale
         let freqs = inv_freq_expanded
             .to_dtype(DType::F32)?
             .matmul(&position_ids_expanded.to_dtype(DType::F32)?)?
@@ -149,26 +159,36 @@ pub fn apply_rotary_pos_emb(
     sin: &Tensor,
     unsqueeze_dim: Option<usize>,
 ) -> Result<(Tensor, Tensor)> {
+    dbg!(q.shape(), k.shape());
     let unsqueeze_dim = unsqueeze_dim.unwrap_or(1);
-    let cos = cos.unsqueeze(unsqueeze_dim)?;
-    let sin = sin.unsqueeze(unsqueeze_dim)?;
+    let cos_ = cos.unsqueeze(unsqueeze_dim)?;
+    let sin_ = sin.unsqueeze(unsqueeze_dim)?;
+    dbg!(cos.shape(), sin.shape());
 
     //b, h, s, d = q.shape
     //q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
     //b, h, s, d = k.shape
     //k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    // NOTE: q and k have differnent dimensions. And torch can brodacast automactily. We need to
+    // handle this manually.
     let (b, h, s, d) = q.dims4()?;
     let q = q
         .reshape((b, h, s, d / 2, 2))?
         .transpose(4, 3)?
         .reshape((b, h, s, d))?;
+    dbg!(q.shape(), k.shape());
+    let cos = cos_.broadcast_as((b, h, s, d))?;
+    let sin = sin_.broadcast_as((b, h, s, d))?;
+
+    let q_embed = (&q * &cos)? + &(rotate_half(&q)? * &sin)?;
     let (b, h, s, d) = k.dims4()?;
     let k = k
         .reshape((b, h, s, d / 2, 2))?
         .transpose(4, 3)?
         .reshape((b, h, s, d))?;
+    let cos = cos_.broadcast_as((b, h, s, d))?;
+    let sin = sin_.broadcast_as((b, h, s, d))?;
 
-    let q_embed = (&q * &cos)? + &(rotate_half(&q)? * &sin)?;
     let k_embed = (&k * &cos)? + &(rotate_half(&k)? * &sin)?;
 
     Ok((q_embed?, k_embed?))
