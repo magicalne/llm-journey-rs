@@ -147,8 +147,8 @@ impl LlamaYaRNScaledRotaryEmbedding {
 fn rotate_half(x: &Tensor) -> Result<Tensor> {
     let last_dim = x.dim(x.dims().len() - 1)?;
     let half_dim = last_dim / 2;
-    let x1 = x.i((.., ..half_dim))?;
-    let x2 = x.i((.., half_dim..))?;
+    let x1 = x.i((.., .., .., ..half_dim))?;
+    let x2 = x.i((.., .., .., half_dim..))?;
     Tensor::cat(&[&x2.neg()?, &x1], x.dims().len() - 1)
 }
 
@@ -159,11 +159,9 @@ pub fn apply_rotary_pos_emb(
     sin: &Tensor,
     unsqueeze_dim: Option<usize>,
 ) -> Result<(Tensor, Tensor)> {
-    dbg!(q.shape(), k.shape());
     let unsqueeze_dim = unsqueeze_dim.unwrap_or(1);
     let cos_ = cos.unsqueeze(unsqueeze_dim)?;
     let sin_ = sin.unsqueeze(unsqueeze_dim)?;
-    dbg!(cos.shape(), sin.shape());
 
     //b, h, s, d = q.shape
     //q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
@@ -171,12 +169,13 @@ pub fn apply_rotary_pos_emb(
     //k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
     // NOTE: q and k have differnent dimensions. And torch can brodacast automactily. We need to
     // handle this manually.
+    // q shape: [batch, num_heads, seq_len, dim]
+    // k shape: [batch, 1,         seq_len, dim]
     let (b, h, s, d) = q.dims4()?;
     let q = q
         .reshape((b, h, s, d / 2, 2))?
         .transpose(4, 3)?
         .reshape((b, h, s, d))?;
-    dbg!(q.shape(), k.shape());
     let cos = cos_.broadcast_as((b, h, s, d))?;
     let sin = sin_.broadcast_as((b, h, s, d))?;
 

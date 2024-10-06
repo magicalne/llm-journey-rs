@@ -208,16 +208,24 @@ impl DeepseekV2Moe {
     ) -> Result<Tensor> {
         let device = hidden_states.device();
 
-        let cnts = Tensor::zeros((topk_ids.dim(0)?, self.experts.len()), DType::U32, device)?;
+        dbg!(topk_ids.shape(), topk_weight.shape());
+        let cnts = Tensor::zeros(
+            (topk_ids.dim(0)?, self.experts.len()),
+            topk_ids.dtype(),
+            device,
+        )?;
         let cnts = scatter(&cnts, 1, topk_ids, 1.)?;
+        dbg!("00");
 
         let tokens_per_expert = cnts.sum_keepdim(0)?;
         let idxs = topk_ids.arg_sort_last_dim(false)?;
         let idxs = (idxs.to_dtype(DType::F64)? / (topk_ids.dims2()?.1 as f64))?;
         let idxs = idxs.to_dtype(DType::U32)?;
+        dbg!("01");
 
         let sorted_tokens = hidden_states.i(&idxs)?;
         let tokens_per_expert = tokens_per_expert.to_vec1::<u32>()?; // TODO: is this dtype right?
+        dbg!("02");
 
         let mut outputs = Vec::new();
         let mut start_idx = 0;
@@ -233,6 +241,7 @@ impl DeepseekV2Moe {
             outputs.push(expert_out);
             start_idx = end_idx;
         }
+        dbg!(&outputs);
 
         let outs = if !outputs.is_empty() {
             Tensor::cat(&outputs, 0)?
@@ -263,6 +272,7 @@ impl Module for DeepseekV2Moe {
         let (b_size, seq_len, hidden_dim) = hidden_states.dims3()?;
         let hidden_states = hidden_states.reshape(((), hidden_dim))?;
         let scores = self.gate.forward(&hidden_states)?;
+        dbg!(scores.shape());
 
         // routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         // top_x contains the row indexes to evaluate for each expert.
@@ -295,7 +305,9 @@ impl Module for DeepseekV2Moe {
         } else {
             (topk_weights * self.config.routed_scaling_factor)?
         };
+        dbg!(1);
         let y = self.moe_infer(&hidden_states, &topk_idx, &topk_weight)?;
+        dbg!(2);
         let y = (y + self.shared_experts.forward(identity)?)?;
         Ok(y)
     }
@@ -463,8 +475,6 @@ impl Attention {
             )?
         };
 
-        dbg!(q.shape());
-
         //q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
         //q_nope, q_pe = torch.split(
         //    q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -498,7 +508,6 @@ impl Attention {
             .i((.., .., self.config.kv_lora_rank..))?
             .reshape((bsz, q_len, 1, self.config.qk_rope_head_dim))?
             .transpose(1, 2)?;
-        dbg!(q_pe.shape(), k_pe.shape());
         //kv = (
         //    self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
         //    .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
@@ -533,8 +542,16 @@ impl Attention {
 
         let (cos, sin) = self.rotary_emb.forward(&q_pe, position_ids)?;
         let (q_pe, k_pe) = apply_rotary_pos_emb(&q_pe, &k_pe, &cos, &sin, None)?;
-        dbg!(3);
+        dbg!(q_pe.shape(), k_pe.shape());
+        dbg!(q_nope.shape(), k_nope.shape());
+        //TODO:
+        //Caused by:
+        //    0: self_attn
+        //    1: slice-assign: the range for dim 1 (0..16) does not match the size of src 1
 
+        //query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+        //query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+        //query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
         let query_states = Tensor::zeros(
             (bsz, self.config.num_attention_heads, q_len, self.q_head_dim),
             hidden_states.dtype(),
@@ -550,6 +567,9 @@ impl Attention {
             &q_pe,
         )?;
 
+        //key_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+        //key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+        //key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
         let key_states = Tensor::zeros(
             (bsz, self.config.num_attention_heads, q_len, self.q_head_dim),
             hidden_states.dtype(),
@@ -560,9 +580,11 @@ impl Attention {
             &[(..d1), (..d2), (..d3), (..self.config.qk_nope_head_dim)],
             &k_nope,
         )?;
+        // k_pe only has a single head.
+        let k_pe_ = k_pe.broadcast_as(q_pe.shape())?;
         key_states.slice_assign(
             &[(0..), (0..), (0..), (self.config.qk_nope_head_dim..)],
-            &k_pe,
+            &k_pe_,
         )?;
 
         /*
@@ -584,6 +606,9 @@ impl Attention {
             (query_states.matmul(&key_states.transpose(2, 3)?)? * self.softmax_scale)?;
 
         let attn_weights = if let Some(mask) = attention_mask {
+            let mask = mask
+                .broadcast_as(attn_weights.shape())?
+                .to_dtype(DType::F32);
             (&attn_weights + mask)?
         } else {
             attn_weights
@@ -665,13 +690,11 @@ impl Mlp {
             cfg.hidden_act,
         )?))
     }
-}
 
-impl Module for Mlp {
-    fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+    fn forward(&self, xs: &Tensor) -> anyhow::Result<Tensor> {
         match self {
-            Mlp::Moe(moe) => moe.forward(xs),
-            Mlp::Mlp(mlp) => mlp.forward(xs),
+            Mlp::Moe(moe) => moe.forward(xs).context("Moe"),
+            Mlp::Mlp(mlp) => mlp.forward(xs).context("mlp"),
         }
     }
 }
@@ -733,7 +756,6 @@ impl DeepseekV2DecoderLayer {
             .input_layernorm
             .forward(hidden_states)
             .context("input_layernorm")?;
-        dbg!(hidden_states.shape());
         let (hidden_states, self_attn_weights, present_key_value) = self
             .self_attn
             .forward(
@@ -909,7 +931,12 @@ impl Model {
         let attention_mask = if seq_len == 1 {
             None
         } else {
-            Some(self.mask(seq_len, input_ids.device())?)
+            let mask = self
+                .mask(seq_len, input_ids.device())?
+                .unsqueeze(0)?
+                .unsqueeze(0)?;
+            // FIXME: The first dimension should be equal to batch_size.
+            Some(mask)
         };
         // [batch_size, seq_len, hidden_size]
         let inputs_embeds = self.embed_tokens.forward(input_ids).context("embedding")?;

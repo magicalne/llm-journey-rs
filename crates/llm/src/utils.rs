@@ -8,6 +8,7 @@ pub fn topk(tensor: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     Ok((values, topk_indices))
 }
 
+// FIXME: unexpected rank, expected: 1, got: 2 ([4, 6])
 pub fn scatter(tensor: &Tensor, dim: usize, index: &Tensor, value: f64) -> Result<Tensor> {
     let mut result = tensor.clone();
 
