@@ -56,10 +56,10 @@ impl Module for DeepSeekV2MLP {
         //act = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         //down_proj = self.down_proj(act)
         //return down_proj
-        let act = self
-            .act_fn
-            .forward(&(self.gate_proj.forward(xs)? * self.up_proj.forward(xs)?)?)?;
-        self.down_proj.forward(&act)
+        let act =
+            (self.act_fn.forward(&self.gate_proj.forward(xs)?)? * self.up_proj.forward(xs)?)?;
+        let down_proj = self.down_proj.forward(&act)?;
+        Ok(down_proj)
     }
 }
 
@@ -200,7 +200,120 @@ impl DeepseekV2Moe {
         })
     }
 
-    fn moe_infer(
+    fn moe_infer(&self, x: &Tensor, topk_ids: &Tensor, topk_weight: &Tensor) -> Result<Tensor> {
+        dbg!(x.shape());
+        let batch_size = topk_ids.dim(0)?;
+        let num_experts = self.experts.len();
+
+        // Create zeros tensor and scatter
+        let cnts = Tensor::zeros(
+            (batch_size, num_experts),
+            topk_ids.dtype(),
+            topk_ids.device(),
+        )?;
+        let source = topk_ids.ones_like()?;
+        let cnts = cnts.scatter_add(topk_ids, &source, 1)?;
+        dbg!(&cnts);
+
+        // Sum tokens per expert
+        let tokens_per_expert = cnts.sum(0)?;
+        dbg!(&tokens_per_expert);
+
+        // Flatten and get sorting indices
+
+        let idxs = topk_ids.flatten_all()?.arg_sort_last_dim(false)?;
+        dbg!(&idxs);
+
+        // Sort tokens
+        // sorted_tokens = x[idxs // topk_ids.shape[1]]
+        let idxs = (idxs.to_dtype(DType::F64)? / (topk_ids.dim(1)? as f64))?;
+        let idxs = idxs.to_dtype(DType::U32)?;
+
+        let sorted_tokens = x.index_select(&idxs, 0)?;
+        dbg!(&sorted_tokens);
+
+        // Convert tokens_per_expert to Vec for iteration
+        let tokens_per_expert_vec: Vec<u32> = tokens_per_expert.to_vec1()?;
+
+        // Process each expert
+        let mut outputs = Vec::new();
+        let mut start_idx = 0u32;
+
+        for (i, &num_tokens) in tokens_per_expert_vec.iter().enumerate() {
+            let end_idx = start_idx + num_tokens;
+            if num_tokens == 0 {
+                continue;
+            }
+
+            let expert_idx = i;
+            let expert = &self.experts[expert_idx];
+
+            let tokens_slice = sorted_tokens.narrow(0, start_idx as usize, num_tokens as usize)?;
+            let expert_out = expert.forward(&tokens_slice)?;
+            outputs.push(expert_out);
+
+            start_idx = end_idx;
+        }
+        dbg!(&outputs);
+
+        // Concatenate outputs or create empty tensor
+        let outs = if !outputs.is_empty() {
+            Tensor::cat(&outputs, 0)?
+        } else {
+            sorted_tokens.zeros_like()?
+            //unsafe { sorted_tokens.empty_like()? }
+        };
+
+        dbg!(&outs);
+
+        // Create new tensor and scatter results back
+        let new_x = outs.zeros_like()?;
+        //let new_x = unsafe { Tensor::empty_like(&outs)? };
+
+        // new_x = torch.empty_like(outs)
+        // new_x[idxs] = outs
+        // final_out = (
+        //     new_x.view(*topk_ids.shape, -1)
+        //     .type(topk_weight.dtype)
+        //     .mul_(topk_weight.unsqueeze(dim=-1))
+        //     .sum(dim=1)
+        //     .type(new_x.dtype)
+        // )
+        //
+        // outs = Tensor[dims 24, 2048; f32]
+        // idxs = Tensor[dims 24; u32]
+        //
+        // The operation `new_x[idxs] = outs` is reordering the rows of outs back to their original order before expert processing. It's essentially an inverse permutation of the sorting that was done earlier with idxs.
+        // Another approach:
+        // new_x2 = torch.zeros_like(outs)
+        // idxs_expanded = idxs.unsqueeze(-1).expand_as(outs)
+        // new_x2.scatter_(0, idxs_expanded, outs)
+
+        let idxs_expanded = idxs
+            .unsqueeze(D::Minus1)?
+            .expand(outs.shape())?
+            .contiguous()?;
+        let new_x = new_x.scatter_add(&idxs_expanded, &outs, 0)?;
+        dbg!(&new_x);
+
+        // Final processing
+        let hidden_dim = new_x.dim(1)?;
+        let reshaped = new_x.reshape((batch_size, topk_ids.dim(1)?, hidden_dim))?;
+        let weight_expanded = topk_weight
+            .unsqueeze(D::Minus1)?
+            .broadcast_as(reshaped.shape())?;
+        dbg!(&weight_expanded);
+
+        let weighted = reshaped
+            .to_dtype(weight_expanded.dtype())?
+            .mul(&weight_expanded)?;
+
+        let final_out = weighted.sum(1)?.to_dtype(new_x.dtype())?;
+
+        Ok(final_out)
+    }
+
+    fn moe_infer_(
         &self,
         hidden_states: &Tensor,
         topk_ids: &Tensor,
@@ -208,20 +321,46 @@ impl DeepseekV2Moe {
     ) -> Result<Tensor> {
         let device = hidden_states.device();
 
-        dbg!(topk_ids.shape(), topk_weight.shape());
+        dbg!(hidden_states.shape(), topk_ids.shape(), topk_weight.shape());
         let cnts = Tensor::zeros(
             (topk_ids.dim(0)?, self.experts.len()),
             topk_ids.dtype(),
             device,
         )?;
-        let cnts = scatter(&cnts, 1, topk_ids, 1.)?;
-        dbg!("00");
+        let source = topk_ids.ones_like()?;
+        let cnts = cnts.scatter_add(topk_ids, &source, 1)?;
 
         let tokens_per_expert = cnts.sum_keepdim(0)?;
         let idxs = topk_ids.arg_sort_last_dim(false)?;
         let idxs = (idxs.to_dtype(DType::F64)? / (topk_ids.dims2()?.1 as f64))?;
         let idxs = idxs.to_dtype(DType::U32)?;
-        dbg!("01");
+        dbg!(topk_ids, topk_weight, &idxs);
+        println!("top_ids: {:?}", topk_ids.to_vec2::<u32>()?);
+        println!("topk_weights: {:?}", topk_weight.to_vec2::<f32>()?);
+
+        //let mut ys = hidden_states.zeros_like()?;
+        //for (expert_idx, expert_layer) in self.experts.iter().enumerate() {
+        //    let top_x = &top_x[expert_idx];
+        //    if top_x.is_empty() {
+        //        continue;
+        //    }
+        //    let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
+        //    let selected_experts =
+        //        Tensor::new(selected_experts[expert_idx].as_slice(), xs.device())?
+        //            .reshape(((), 1))?
+        //            .to_dtype(xs.dtype())?;
+        //    // Index the correct hidden states and compute the expert hidden state for
+        //    // the current expert. We need to make sure to multiply the output hidden
+        //    // states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+        //    let current_state = xs.index_select(&top_x, 0)?.reshape(((), hidden_dim))?;
+        //    // current_hidden_states = expert_layer(current_state, routing_weights[top_x_list, idx_list, None])
+        //    let current_hidden_states = expert_layer.forward(&current_state)?;
+        //    let current_hidden_states = current_hidden_states.broadcast_mul(&selected_experts)?;
+        //    ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
+        //}
+
+        //--
+        //hidden_states.index_select(indexes, dim);
 
         let sorted_tokens = hidden_states.i(&idxs)?;
         let tokens_per_expert = tokens_per_expert.to_vec1::<u32>()?; // TODO: is this dtype right?
@@ -268,6 +407,8 @@ impl DeepseekV2Moe {
 
 impl Module for DeepseekV2Moe {
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        dbg!("original shape", hidden_states.shape());
+        let original_shape = hidden_states.shape();
         let identity = hidden_states;
         let (b_size, seq_len, hidden_dim) = hidden_states.dims3()?;
         let hidden_states = hidden_states.reshape(((), hidden_dim))?;
@@ -306,9 +447,13 @@ impl Module for DeepseekV2Moe {
             (topk_weights * self.config.routed_scaling_factor)?
         };
         dbg!(1);
-        let y = self.moe_infer(&hidden_states, &topk_idx, &topk_weight)?;
-        dbg!(2);
-        let y = (y + self.shared_experts.forward(identity)?)?;
+        let y = self
+            .moe_infer(&hidden_states, &topk_idx, &topk_weight)?
+            .reshape(original_shape)?;
+        dbg!(y.shape());
+        let shared_y = self.shared_experts.forward(identity)?;
+        dbg!(shared_y.shape());
+        let y = (y + shared_y)?;
         Ok(y)
     }
 }
@@ -788,8 +933,9 @@ impl DeepseekV2DecoderLayer {
 
 pub struct Model {
     embed_tokens: Embedding,
-    norm: RmsNorm,
     layers: Vec<DeepseekV2DecoderLayer>,
+    norm: RmsNorm,
+    output: Linear,
     masks: HashMap<usize, Tensor>,
 }
 
@@ -810,6 +956,7 @@ impl Model {
             config.rms_norm_eps,
             vb.pp("output_norm"),
         )?;
+        let output = linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("output"))?;
         // Parallelize loading weights
         let vb = vb.pp("blk");
         let post_attention_layernorms = (0..config.num_hidden_layers)
@@ -898,8 +1045,9 @@ impl Model {
 
         Ok(Self {
             embed_tokens,
-            norm,
             layers,
+            norm,
+            output,
             masks: HashMap::default(),
         })
     }
@@ -935,7 +1083,7 @@ impl Model {
                 .mask(seq_len, input_ids.device())?
                 .unsqueeze(0)?
                 .unsqueeze(0)?;
-            // FIXME: The first dimension should be equal to batch_size.
+            // FIXME: The first dimension should be equal to batch_size. And it doesn't support `batch` right now.
             Some(mask)
         };
         // [batch_size, seq_len, hidden_size]
@@ -948,7 +1096,8 @@ impl Model {
         let mut hidden_states = inputs_embeds;
 
         // decoder layers
-        for decoder_layer in &self.layers {
+        for (layer_idx, decoder_layer) in self.layers.iter().enumerate() {
+            dbg!(layer_idx);
             let layer_outputs = decoder_layer
                 .forward(
                     &hidden_states,
@@ -962,8 +1111,10 @@ impl Model {
                 .context("decoder_layer")?;
             hidden_states = layer_outputs.0;
         }
-        hidden_states = self.norm.forward(&hidden_states).context("norm")?;
-        Ok(hidden_states)
+        let x = self.norm.forward(&hidden_states).context("norm")?;
+        let x = x.i((.., seq_len - 1, ..))?;
+        let x = self.output.forward(&x)?;
+        Ok(x)
     }
 }
 

@@ -46,6 +46,8 @@ pub fn masked_fill<D: WithDType>(xs: &Tensor, mask: &Tensor, value: D) -> Result
 mod tests {
     use candle_core::{Device, IndexOp, Result, Tensor};
 
+    use super::scatter;
+
     fn split_tensor(tensor: &Tensor) -> Result<Vec<Tensor>> {
         let mut result = Vec::new();
         for i in 0..10 {
@@ -55,7 +57,7 @@ mod tests {
         Ok(result)
     }
     #[test]
-    fn test_i() -> Result<()> {
+    fn test_split() -> Result<()> {
         // Assume we have a tensor with shape (10, 3, 3)
         let big_tensor = Tensor::randn(0f32, 1f32, (10, 3, 3), &Device::Cpu)?;
 
@@ -65,6 +67,16 @@ mod tests {
         for (i, t) in tensor_list.iter().enumerate() {
             println!("Tensor {}: {:?}", i, t.shape());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_scatter() -> Result<()> {
+        let device = Device::Cpu;
+        let tensor = Tensor::randn(0f32, 1f32, (6, 4), &device)?;
+        let dim = 1;
+        let index = Tensor::new(vec![vec![0u32, 1]], &device)?;
+        scatter(&tensor, dim, &index, 1.)?;
         Ok(())
     }
 }
