@@ -19,15 +19,12 @@ tokenizers = "0.20.0"
 #candle-transformers = "0.7"
 #candle-flash-attn = "0.7"
 
+# I forked candle and make some updates: https://github.com/magicalne/candle
 candle-core = { path = "/run/media/magicalne/ssd1/git/opensource/candle/candle-core/"}
 candle-nn= { path = "/run/media/magicalne/ssd1/git/opensource/candle/candle-nn/"}
 candle-transformers= { path = "/run/media/magicalne/ssd1/git/opensource/candle/candle-transformers/"}
 candle-flash-attn= { path = "/run/media/magicalne/ssd1/git/opensource/candle/candle-flash-attn/"}
 
-#candle-core = { git = "https://github.com/EricLBuehler/candle.git", version = "0.6.0", rev = "8a99f7c" }
-#candle-nn = { git = "https://github.com/EricLBuehler/candle.git", version = "0.6.0", rev = "8a99f7c" }
-#candle-transformers= { git = "https://github.com/EricLBuehler/candle.git", version = "0.6.0", rev = "8a99f7c" }
-#candle-flash-attn = { git = "https://github.com/EricLBuehler/candle.git", version = "0.6.0", rev = "8a99f7c" }
 bindgen_cuda = {git = "https://github.com/guoqingbao/bindgen_cuda.git", version = "0.1.6"}
 rayon = "1.10.0"
 

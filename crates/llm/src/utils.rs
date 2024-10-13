@@ -1,4 +1,4 @@
-use candle_core::{DType, Device, Result, Tensor, WithDType, D};
+use candle_core::{Result, Tensor, WithDType, D};
 
 pub fn topk(tensor: &Tensor, topk: usize) -> Result<(Tensor, Tensor)> {
     // Sorted descending

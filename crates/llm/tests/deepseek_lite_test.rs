@@ -84,7 +84,7 @@ fn test_lite() -> anyhow::Result<()> {
     let start_prompt_processing = std::time::Instant::now();
     let input = Tensor::new(prompt_tokens.as_slice(), &device)?.unsqueeze(0)?;
 
-    let logits = model.forward(&input, 0, None, false, false, None)?;
+    let logits = model.forward(&input, 0, false, false)?;
     let logits = logits.squeeze(0)?;
 
     let mut next_token = logits_processor.sample(&logits)?;
@@ -111,7 +111,7 @@ fn test_lite() -> anyhow::Result<()> {
     for index in 0..to_sample {
         let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
         //let logits = model.forward(&input, prompt_tokens.len() + index)?;
-        let logits = model.forward(&input, index as u32, None, false, false, None)?;
+        let logits = model.forward(&input, index as u32, false, false)?;
         position_index += 1;
         let logits = logits.squeeze(0)?;
         //let logits = if args.repeat_penalty == 1. {

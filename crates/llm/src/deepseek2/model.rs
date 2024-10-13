@@ -5,11 +5,8 @@ use crate::{
     utils::{masked_fill, scatter, topk},
 };
 use anyhow::Context;
-use candle_core::{
-    self, backend::BackendDevice, quantized::QTensor, CudaDevice, DType, Device, Error, IndexOp,
-    Module, Result, Tensor, D,
-};
-use candle_nn::{ops::softmax_last_dim, rotary_emb, Activation, Dropout, Embedding};
+use candle_core::{self, quantized::QTensor, DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle_nn::{ops::softmax_last_dim, Activation, Dropout, Embedding};
 use candle_transformers::{
     quantized_nn::{linear_b, linear_no_bias, Linear, RmsNorm},
     quantized_var_builder::VarBuilder,
@@ -201,7 +198,6 @@ impl DeepseekV2Moe {
     }
 
     fn moe_infer(&self, x: &Tensor, topk_ids: &Tensor, topk_weight: &Tensor) -> Result<Tensor> {
-        dbg!(x.shape());
         let batch_size = topk_ids.dim(0)?;
         let num_experts = self.experts.len();
 
@@ -213,16 +209,13 @@ impl DeepseekV2Moe {
         )?;
         let source = topk_ids.ones_like()?;
         let cnts = cnts.scatter_add(topk_ids, &source, 1)?;
-        dbg!(&cnts);
 
         // Sum tokens per expert
         let tokens_per_expert = cnts.sum(0)?;
-        dbg!(&tokens_per_expert);
 
         // Flatten and get sorting indices
 
         let idxs = topk_ids.flatten_all()?.arg_sort_last_dim(false)?;
-        dbg!(&idxs);
 
         // Sort tokens
         // sorted_tokens = x[idxs // topk_ids.shape[1]]
@@ -230,7 +223,6 @@ impl DeepseekV2Moe {
         let idxs = idxs.to_dtype(DType::U32)?;
 
         let sorted_tokens = x.index_select(&idxs, 0)?;
-        dbg!(&sorted_tokens);
 
         // Convert tokens_per_expert to Vec for iteration
         let tokens_per_expert_vec: Vec<u32> = tokens_per_expert.to_vec1()?;
@@ -254,7 +246,6 @@ impl DeepseekV2Moe {
 
             start_idx = end_idx;
         }
-        dbg!(&outputs);
 
         // Concatenate outputs or create empty tensor
         let outs = if !outputs.is_empty() {
@@ -263,8 +254,6 @@ impl DeepseekV2Moe {
             sorted_tokens.zeros_like()?
             //unsafe { sorted_tokens.empty_like()? }
         };
-
-        dbg!(&outs);
 
         // Create new tensor and scatter results back
         let new_x = outs.zeros_like()?;
@@ -294,7 +283,6 @@ impl DeepseekV2Moe {
             .expand(outs.shape())?
             .contiguous()?;
         let new_x = new_x.scatter_add(&idxs_expanded, &outs, 0)?;
-        dbg!(&new_x);
 
         // Final processing
         let hidden_dim = new_x.dim(1)?;
@@ -302,7 +290,6 @@ impl DeepseekV2Moe {
         let weight_expanded = topk_weight
             .unsqueeze(D::Minus1)?
             .broadcast_as(reshaped.shape())?;
-        dbg!(&weight_expanded);
 
         let weighted = reshaped
             .to_dtype(weight_expanded.dtype())?
@@ -312,108 +299,15 @@ impl DeepseekV2Moe {
 
         Ok(final_out)
     }
-
-    fn moe_infer_(
-        &self,
-        hidden_states: &Tensor,
-        topk_ids: &Tensor,
-        topk_weight: &Tensor,
-    ) -> Result<Tensor> {
-        let device = hidden_states.device();
-
-        dbg!(hidden_states.shape(), topk_ids.shape(), topk_weight.shape());
-        let cnts = Tensor::zeros(
-            (topk_ids.dim(0)?, self.experts.len()),
-            topk_ids.dtype(),
-            device,
-        )?;
-        let source = topk_ids.ones_like()?;
-        let cnts = cnts.scatter_add(topk_ids, &source, 1)?;
-
-        let tokens_per_expert = cnts.sum_keepdim(0)?;
-        let idxs = topk_ids.arg_sort_last_dim(false)?;
-        let idxs = (idxs.to_dtype(DType::F64)? / (topk_ids.dims2()?.1 as f64))?;
-        let idxs = idxs.to_dtype(DType::U32)?;
-        dbg!(topk_ids, topk_weight, &idxs);
-        println!("top_ids: {:?}", topk_ids.to_vec2::<u32>()?);
-        println!("topk_weights: {:?}", topk_weight.to_vec2::<f32>()?);
-
-        //let mut ys = hidden_states.zeros_like()?;
-        //for (expert_idx, expert_layer) in self.experts.iter().enumerate() {
-        //    let top_x = &top_x[expert_idx];
-        //    if top_x.is_empty() {
-        //        continue;
-        //    }
-        //    let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
-        //    let selected_experts =
-        //        Tensor::new(selected_experts[expert_idx].as_slice(), xs.device())?
-        //            .reshape(((), 1))?
-        //            .to_dtype(xs.dtype())?;
-        //    // Index the correct hidden states and compute the expert hidden state for
-        //    // the current expert. We need to make sure to multiply the output hidden
-        //    // states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-        //    let current_state = xs.index_select(&top_x, 0)?.reshape(((), hidden_dim))?;
-        //    // current_hidden_states = expert_layer(current_state, routing_weights[top_x_list, idx_list, None])
-        //    let current_hidden_states = expert_layer.forward(&current_state)?;
-        //    let current_hidden_states = current_hidden_states.broadcast_mul(&selected_experts)?;
-        //    ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
-        //}
-
-        //--
-        //hidden_states.index_select(indexes, dim);
-
-        let sorted_tokens = hidden_states.i(&idxs)?;
-        let tokens_per_expert = tokens_per_expert.to_vec1::<u32>()?; // TODO: is this dtype right?
-        dbg!("02");
-
-        let mut outputs = Vec::new();
-        let mut start_idx = 0;
-
-        for (i, &num_tokens) in tokens_per_expert.iter().enumerate() {
-            let end_idx = start_idx + num_tokens as usize;
-            if num_tokens == 0 {
-                continue;
-            }
-            let expert = &self.experts[i];
-            let tokens_for_this_expert = sorted_tokens.i(start_idx..end_idx)?;
-            let expert_out = expert.forward(&tokens_for_this_expert)?;
-            outputs.push(expert_out);
-            start_idx = end_idx;
-        }
-        dbg!(&outputs);
-
-        let outs = if !outputs.is_empty() {
-            Tensor::cat(&outputs, 0)?
-        } else {
-            sorted_tokens.zeros_like()?
-            //unsafe { sorted_tokens.empty_like()? }
-        };
-
-        let new_x = outs.zeros_like()?;
-        //let new_x = unsafe { Tensor::empty_like(&outs)? };
-
-        new_x.scatter_add(&idxs, &outs, 0)?;
-
-        let final_out = new_x
-            .reshape((topk_ids.dim(0)?, topk_ids.dim(1)?, ()))?
-            .to_dtype(topk_weight.dtype())?
-            .mul(topk_weight.unsqueeze(D::Minus1)?)?
-            .sum(1)?
-            .to_dtype(new_x.dtype())?;
-
-        Ok(final_out)
-    }
 }
 
 impl Module for DeepseekV2Moe {
     fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        dbg!("original shape", hidden_states.shape());
         let original_shape = hidden_states.shape();
         let identity = hidden_states;
         let (b_size, seq_len, hidden_dim) = hidden_states.dims3()?;
         let hidden_states = hidden_states.reshape(((), hidden_dim))?;
         let scores = self.gate.forward(&hidden_states)?;
-        dbg!(scores.shape());
 
         // routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         // top_x contains the row indexes to evaluate for each expert.
@@ -426,6 +320,7 @@ impl Module for DeepseekV2Moe {
                 let (group_idx, _) = topk(&group_scores, self.config.topk_group)?; // [n, top_k_group]
                 let group_mask = &group_scores.zeros_like()?; // [n, n_group]
 
+                // FIXME: scatter should be replaced with Tensor::scaltter_add
                 let group_mask = scatter(group_mask, 1, &group_idx, 1.)?;
                 let score_mask = group_mask
                     .unsqueeze(D::Minus1)?
@@ -446,13 +341,10 @@ impl Module for DeepseekV2Moe {
         } else {
             (topk_weights * self.config.routed_scaling_factor)?
         };
-        dbg!(1);
         let y = self
             .moe_infer(&hidden_states, &topk_idx, &topk_weight)?
             .reshape(original_shape)?;
-        dbg!(y.shape());
         let shared_y = self.shared_experts.forward(identity)?;
-        dbg!(shared_y.shape());
         let y = (y + shared_y)?;
         Ok(y)
     }
@@ -571,11 +463,10 @@ impl Attention {
         rotary_emb: Arc<LlamaYaRNScaledRotaryEmbedding>,
         q_type: AttentionType,
         kv_a_layernorm: RmsNorm,
-        kv_a_proj_with_mqa: Linear,
-        kv_b_proj: Linear,
-        o_proj: Linear,
+        proj_weights: (Linear, Linear, Linear),
     ) -> Result<Self> {
-        let rope_scaling = &cfg.rope_scaling;
+        let (kv_a_proj_with_mqa, kv_b_proj, o_proj) = proj_weights;
+        //    let rope_scaling = &cfg.rope_scaling;
         let mut softmax_scale = (q_head_dim as f64).powf(-0.5);
         let mscale_all_dim = cfg.rope_scaling.mscale_all_dim;
         let scaling_factor = cfg.rope_scaling.factor;
@@ -600,13 +491,9 @@ impl Attention {
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
         position_ids: &Tensor,
-        _past_key_value: Option<&Cache>,
         output_attentions: bool,
-        _use_cache: bool,
-        _cache_position: Option<&Tensor>,
     ) -> Result<(Tensor, Option<Tensor>, Cache)> {
         // [batch_size, seq_len, hidden_size]
-        dbg!(hidden_states.shape());
         let (bsz, q_len, _hidde_size) = hidden_states.dims3()?;
 
         let q = if self.config.q_lora_rank.is_none() {
@@ -687,8 +574,6 @@ impl Attention {
 
         let (cos, sin) = self.rotary_emb.forward(&q_pe, position_ids)?;
         let (q_pe, k_pe) = apply_rotary_pos_emb(&q_pe, &k_pe, &cos, &sin, None)?;
-        dbg!(q_pe.shape(), k_pe.shape());
-        dbg!(q_nope.shape(), k_nope.shape());
         //TODO:
         //Caused by:
         //    0: self_attn
@@ -798,6 +683,7 @@ impl Attention {
         Ok((attn_output, attn_weights, past_key_value))
     }
 }
+#[allow(dead_code)]
 fn flash_attn(
     q: &Tensor,
     k: &Tensor,
@@ -891,10 +777,8 @@ impl DeepseekV2DecoderLayer {
         hidden_states: &Tensor,
         attention_mask: Option<&Tensor>,
         position_ids: &Tensor,
-        past_key_value: Option<&Cache>,
         output_attentions: bool,
         use_cache: bool,
-        cache_position: Option<&Tensor>,
     ) -> anyhow::Result<(Tensor, Option<Tensor>, Option<Cache>)> {
         let residual = hidden_states;
         let hidden_states = self
@@ -907,10 +791,7 @@ impl DeepseekV2DecoderLayer {
                 &hidden_states,
                 attention_mask,
                 position_ids,
-                past_key_value,
                 output_attentions,
-                use_cache,
-                cache_position,
             )
             .context("self_attn")?;
         let hidden_states = (residual + hidden_states)?;
@@ -1069,10 +950,10 @@ impl Model {
         input_ids: &Tensor, // [batch_size, seq_len]
         // position_ids: &Tensor,
         position_index: u32,
-        past_key_value: Option<&Cache>,
+        // past_key_value: Option<&Cache>,
         use_cache: bool,
         output_attentions: bool,
-        cache_position: Option<&Tensor>,
+        // cache_position: Option<&Tensor>,
     ) -> anyhow::Result<Tensor> {
         info!("input_ids shape: {:?}", input_ids.shape());
         let (b_sz, seq_len) = input_ids.dims2()?;
@@ -1096,17 +977,14 @@ impl Model {
         let mut hidden_states = inputs_embeds;
 
         // decoder layers
-        for (layer_idx, decoder_layer) in self.layers.iter().enumerate() {
-            dbg!(layer_idx);
+        for decoder_layer in self.layers.iter() {
             let layer_outputs = decoder_layer
                 .forward(
                     &hidden_states,
                     attention_mask.as_ref(),
                     &position_ids,
-                    past_key_value,
                     output_attentions,
                     use_cache,
-                    cache_position,
                 )
                 .context("decoder_layer")?;
             hidden_states = layer_outputs.0;
@@ -1232,9 +1110,7 @@ fn load_attentions(
                     rotary_emb.clone(),
                     q_type,
                     kv_a_layernorm,
-                    kv_a_proj_with_mqa,
-                    kv_b_proj,
-                    o_proj,
+                    (kv_a_proj_with_mqa, kv_b_proj, o_proj),
                 )?;
                 Ok(attn)
             },
